@@ -91,5 +91,43 @@ export type CloseResponse = {
 export type OpenResponse = {
   /** The URL that was actually opened, after normalisation. */
   url: string;
+  /** When this launch happened, in milliseconds since 1970. */
+  openedAt: number;
   results: OpenResult[];
+};
+
+/** Asks what the given windows are showing right now. */
+export type WindowsRequest = {
+  windows: { browser: string; handles: WindowHandle[] }[];
+};
+
+export type WindowStatus = {
+  /** False once the window is gone (closed, or its browser was quit). */
+  open: boolean;
+  /** The page's title, where the browser can tell us. */
+  title?: string;
+  /** The page's address, where the browser can tell us (not Firefox). */
+  url?: string;
+};
+
+export type WindowsResponse = {
+  results: {
+    id: string;
+    /** One entry per handle sent, in the same order. Absent on error. */
+    windows?: WindowStatus[];
+    error?: string;
+  }[];
+};
+
+/** Asks for one window to be brought to the front. */
+export type FocusRequest = {
+  browser: string;
+  handle: WindowHandle;
+};
+
+export type FocusResponse = {
+  /** True when the window is no longer there to show. */
+  gone: boolean;
+  /** True when it is now in front of that browser's other windows. */
+  inFront: boolean;
 };

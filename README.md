@@ -16,6 +16,13 @@ Then open <http://127.0.0.1:3000>. Type a URL, tick the browsers, press
 Turn on **Also open in incognito** to get a second, private window as well as
 the normal one, in every browser that can do it (see the table under Limits).
 
+After you press Open, an **Open windows** list appears: one line per browser,
+its normal window on the left and its incognito window on the right. Each box
+shows the page that window is on right now (title and address; Firefox only
+gives the title) and is refreshed every few seconds, so you can watch all of
+them from one place. Click a box to bring that window to the front. A window
+you close yourself drops off the list.
+
 **Close** shuts the windows the launcher opened, and only those, in the
 browsers that are ticked at that moment. Untick a browser first to keep its
 windows open. Windows you opened yourself are never touched.
@@ -39,6 +46,11 @@ A web page can't start other apps, so the page asks the Node.js server to do it.
 | `app/api/browsers` | `GET` the browsers and whether each is installed. `…/[id]/icon` serves the app's icon. |
 | `app/api/open` | `POST { url, browsers, includePrivate? }` to open the URL. Returns a result per browser, including how its private window went. |
 | `app/api/close` | `POST { windows }` with the handles from `/api/open` to close those windows. |
+| `app/api/windows` | `POST { windows }` to ask what those windows are showing right now. |
+| `app/api/focus` | `POST { browser, handle }` to bring one window to the front. |
+| `lib/api-request.ts` | The checks every POST route starts with, and reading window handles out of a request. |
+| `lib/tracked-windows.ts` | How the page remembers the windows it opened. |
+| `components/open-windows.tsx` | The Open windows list. |
 | `components/launcher.tsx` | The page: URL field, browser cards, results. |
 
 ## Add a browser

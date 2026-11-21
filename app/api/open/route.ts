@@ -1,37 +1,15 @@
+import { badRequest, readOwnJson } from "@/lib/api-request";
 import { isSupportedPlatform, openInBrowsers } from "@/lib/browsers";
-import { rejectUnlessLocal } from "@/lib/local-request";
 import type { OpenResponse } from "@/lib/types";
 import { normalizeUrl } from "@/lib/url";
 
 const MAX_BROWSERS = 50;
 
-function badRequest(error: string, status = 400): Response {
-  return Response.json({ error }, { status });
-}
-
 export async function POST(request: Request) {
-  const rejection = rejectUnlessLocal(request);
-  if (rejection) return rejection;
+  const body = await readOwnJson(request);
+  if ("rejection" in body) return body.rejection;
 
-  // Browsers can't send JSON cross-site without a preflight, so insisting on
-  // it closes the "simple request" loophole on top of the origin checks.
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().startsWith("application/json")) {
-    return badRequest("Send the request as application/json.", 415);
-  }
-
-  let payload: unknown;
-  try {
-    payload = await request.json();
-  } catch {
-    return badRequest("The request body isn't valid JSON.");
-  }
-
-  const {
-    url: rawUrl,
-    browsers,
-    includePrivate,
-  } = (payload ?? {}) as Record<string, unknown>;
+  const { url: rawUrl, browsers, includePrivate } = body.payload;
 
   if (typeof rawUrl !== "string") {
     return badRequest("Missing the URL to open.");
@@ -56,9 +34,10 @@ export async function POST(request: Request) {
     return badRequest("Opening browsers is only supported on macOS for now.", 501);
   }
 
+  const openedAt = Date.now();
   const results = await openInBrowsers(url, browsers, {
     includePrivate: includePrivate === true,
   });
-  const body: OpenResponse = { url, results };
-  return Response.json(body);
+  const response: OpenResponse = { url, openedAt, results };
+  return Response.json(response);
 }

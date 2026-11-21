@@ -8,9 +8,12 @@ import type {
   OpenResult,
   Untracked,
   WindowHandle,
+  WindowsResponse,
 } from "./types";
 import {
   closeTrackedWindows,
+  describeTrackedWindows,
+  focusTrackedWindow,
   openTrackedWindow,
   type CommandLineSteps,
   type ScriptingKind,
@@ -442,7 +445,11 @@ export async function closeInBrowsers(
         return { ...nothing, error: "This browser's windows can't be closed from here." };
       }
 
-      const outcome = await closeTrackedWindows(browser.appPath, handles);
+      const outcome = await closeTrackedWindows(
+        browser.scripting,
+        browser.appPath,
+        handles,
+      );
       if (!outcome.ok) {
         return {
           ...nothing,
@@ -463,6 +470,64 @@ export async function closeInBrowsers(
       };
     }),
   );
+}
+
+/**
+ * Says what each of the given windows is showing. Used by the page to keep
+ * its list of open windows current.
+ */
+export async function describeInBrowsers(
+  requests: readonly { browser: string; handles: readonly WindowHandle[] }[],
+): Promise<WindowsResponse["results"]> {
+  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+
+  return Promise.all(
+    requests.map(async ({ browser: id, handles }) => {
+      const browser = detected.get(id);
+      if (!browser?.appPath || !browser.scripting) {
+        return { id, error: "This browser's windows can't be looked at from here." };
+      }
+      const outcome = await describeTrackedWindows(
+        browser.scripting,
+        browser.appPath,
+        handles,
+      );
+      if (!outcome.ok) {
+        return {
+          id,
+          error: outcome.notAllowed
+            ? notAllowedMessage(browser.name)
+            : outcome.detail,
+        };
+      }
+      return { id, windows: outcome.windows };
+    }),
+  );
+}
+
+/**
+ * Brings one window to the front. Resolves to whether it was still there;
+ * throws with a message for the person when the browser can't be reached.
+ */
+export async function focusInBrowser(
+  id: string,
+  handle: WindowHandle,
+): Promise<{ gone: boolean; inFront: boolean }> {
+  const browser = (await detectBrowsers()).find((b) => b.id === id);
+  if (!browser?.appPath || !browser.scripting) {
+    throw new Error("This browser's windows can't be brought forward from here.");
+  }
+  const outcome = await focusTrackedWindow(
+    browser.scripting,
+    browser.appPath,
+    handle,
+  );
+  if (!outcome.ok) {
+    throw new Error(
+      outcome.notAllowed ? notAllowedMessage(browser.name) : outcome.detail,
+    );
+  }
+  return { gone: outcome.gone, inFront: outcome.inFront };
 }
 
 async function renderIcon(appPath: string): Promise<Buffer> {

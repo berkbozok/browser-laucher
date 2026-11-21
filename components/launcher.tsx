@@ -1,31 +1,38 @@
 "use client";
 
-import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
+import { BrowserIcon } from "@/components/browser-icon";
+import { OpenWindows } from "@/components/open-windows";
+import {
+  MAX_TRACKED_PER_BROWSER,
+  readTrackedWindows,
+  windowKey,
+  windowsFrom,
+  withoutWindows,
+  type TrackedWindow,
+  type TrackedWindows,
+} from "@/lib/tracked-windows";
 import type {
   BrowserInfo,
   BrowsersResponse,
   CloseRequest,
   CloseResponse,
   CloseResult,
+  FocusRequest,
+  FocusResponse,
   OpenRequest,
   OpenResponse,
   OpenResult,
-  WindowHandle,
+  WindowsRequest,
+  WindowsResponse,
+  WindowStatus,
 } from "@/lib/types";
 import { normalizeUrl } from "@/lib/url";
 
+/** How often the page asks what its windows are showing. */
+const WATCH_EVERY_MS = 4000;
+
 const STORAGE_KEY = "browser-launcher:v1";
-
-/** Windows the launcher opened and can still close, per browser id. */
-type TrackedWindows = Record<string, WindowHandle[]>;
-
-/**
- * The most windows remembered per browser, which is also the most the server
- * closes in one go. Beyond it the oldest are dropped; by then they are
- * windows that were closed by hand long ago.
- */
-const MAX_TRACKED_PER_BROWSER = 200;
 
 type Prefs = {
   url: string;
@@ -41,38 +48,6 @@ type LaunchState =
   | { status: "closed"; result: CloseResult };
 
 type Notice = { text: string; allGood: boolean };
-
-function isHandle(value: unknown): value is WindowHandle {
-  if (typeof value !== "object" || value === null) return false;
-  const { windowId, pid, startedAt } = value as Record<string, unknown>;
-  return (
-    (typeof windowId === "string" || typeof windowId === "number") &&
-    typeof pid === "number" &&
-    typeof startedAt === "number"
-  );
-}
-
-function readTrackedWindows(value: unknown): TrackedWindows {
-  if (typeof value !== "object" || value === null) return {};
-  const windows: TrackedWindows = {};
-  for (const [id, handles] of Object.entries(value)) {
-    if (!Array.isArray(handles)) continue;
-    const valid = handles.filter(isHandle);
-    if (valid.length > 0) windows[id] = valid.slice(-MAX_TRACKED_PER_BROWSER);
-  }
-  return windows;
-}
-
-/** The handles of the windows one browser just opened, if it gave any. */
-function handlesOf(result: OpenResult): WindowHandle[] {
-  const extra =
-    result.privateWindow?.status === "opened"
-      ? result.privateWindow.handle
-      : undefined;
-  return [result.handle, extra].filter(
-    (handle): handle is WindowHandle => handle !== undefined,
-  );
-}
 
 function readPrefs(): Prefs | null {
   try {
@@ -196,7 +171,7 @@ function summarizeOpen(results: OpenResult[]): Notice | null {
   );
   if (byHand.length > 0) {
     parts.push(
-      `Windows in ${nameList.format(byHand)} have to be closed by hand.`,
+      `${nameList.format(byHand)} can't be listed or closed from here; close ${byHand.length === 1 ? "its" : "their"} windows by hand.`,
     );
   }
 
@@ -240,6 +215,7 @@ export function Launcher() {
   const [incognito, setIncognito] = useState(false);
   const [launch, setLaunch] = useState<Record<string, LaunchState>>({});
   const [tracked, setTracked] = useState<TrackedWindows>({});
+  const [live, setLive] = useState<Record<string, WindowStatus>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [opening, setOpening] = useState(false);
@@ -299,6 +275,58 @@ export function Launcher() {
     writePrefs({ url, selected: [...selected], incognito, windows: tracked });
   }, [data, url, selected, incognito, tracked]);
 
+  // While the launcher has windows open, keep asking what they show. A window
+  // that turns out to be gone (closed by hand, browser quit) drops off the
+  // list, which also keeps the Close button's count honest.
+  useEffect(() => {
+    const watched = Object.entries(tracked).map(([browser, windows]) => ({
+      browser,
+      handles: windows.map((w) => w.handle),
+    }));
+    if (watched.length === 0 || opening || closing) return;
+
+    let cancelled = false;
+    const look = async () => {
+      if (document.visibilityState !== "visible") return;
+      const request: WindowsRequest = { windows: watched };
+      let response: WindowsResponse;
+      try {
+        response = await requestJson<WindowsResponse>("/api/windows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request),
+        });
+      } catch {
+        return; // The next round will try again.
+      }
+      if (cancelled) return;
+
+      const seen: Record<string, WindowStatus> = {};
+      const gone = new Set<string>();
+      for (const { browser, handles } of watched) {
+        const result = response.results.find((r) => r.id === browser);
+        // No answer for this browser tells us nothing about its windows.
+        if (!result?.windows) continue;
+        handles.forEach((handle, index) => {
+          const status = result.windows?.[index];
+          if (!status) return;
+          const key = windowKey(browser, handle);
+          if (status.open) seen[key] = status;
+          else gone.add(key);
+        });
+      }
+      setLive(seen);
+      setTracked((current) => withoutWindows(current, gone));
+    };
+
+    void look();
+    const timer = window.setInterval(() => void look(), WATCH_EVERY_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tracked, opening, closing]);
+
   const installed = data?.browsers.filter((browser) => browser.installed) ?? [];
   const missing = data?.browsers.filter((browser) => !browser.installed) ?? [];
   const chosen = installed.filter((browser) => selected.has(browser.id));
@@ -308,7 +336,7 @@ export function Launcher() {
     (incognito ? chosen.filter((browser) => browser.supportsPrivate).length : 0);
   // Close only ever touches the browsers that are ticked right now.
   const closable = chosen.flatMap((browser) => {
-    const handles = tracked[browser.id] ?? [];
+    const handles = (tracked[browser.id] ?? []).map((w) => w.handle);
     return handles.length > 0 ? [{ browser: browser.id, handles }] : [];
   });
   const closableCount = closable.reduce((sum, c) => sum + c.handles.length, 0);
@@ -351,7 +379,7 @@ export function Launcher() {
       includePrivate: incognito,
     };
     try {
-      const { results } = await requestJson<OpenResponse>("/api/open", {
+      const { results, openedAt } = await requestJson<OpenResponse>("/api/open", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request),
@@ -368,9 +396,9 @@ export function Launcher() {
       setTracked((current) => {
         const next = { ...current };
         for (const result of results) {
-          const handles = handlesOf(result);
-          if (handles.length > 0) {
-            next[result.id] = [...(next[result.id] ?? []), ...handles].slice(
+          const windows = windowsFrom(result, target, openedAt);
+          if (windows.length > 0) {
+            next[result.id] = [...(next[result.id] ?? []), ...windows].slice(
               -MAX_TRACKED_PER_BROWSER,
             );
           }
@@ -383,6 +411,31 @@ export function Launcher() {
       setFormError(toMessage(error));
     } finally {
       setOpening(false);
+    }
+  }
+
+  async function showWindow(browser: BrowserInfo, target: TrackedWindow) {
+    const request: FocusRequest = { browser: browser.id, handle: target.handle };
+    setFormError(null);
+    try {
+      const { gone } = await requestJson<FocusResponse>("/api/focus", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      if (!gone) return;
+      setTracked((current) =>
+        withoutWindows(
+          current,
+          new Set([windowKey(browser.id, target.handle)]),
+        ),
+      );
+      setNotice({
+        text: `That ${browser.name} window had already been closed.`,
+        allGood: false,
+      });
+    } catch (error) {
+      setFormError(toMessage(error));
     }
   }
 
@@ -541,6 +594,13 @@ export function Launcher() {
           ) : null}
         </p>
       </form>
+
+      <OpenWindows
+        browsers={installed}
+        tracked={tracked}
+        live={live}
+        onShow={(browser, target) => void showWindow(browser, target)}
+      />
 
       <section aria-labelledby="browsers-heading" className="flex flex-col gap-3">
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
@@ -701,7 +761,7 @@ function BrowserCard({
         checked={checked}
         onChange={onToggle}
       />
-      <BrowserIcon browser={browser} />
+      <BrowserIcon id={browser.id} name={browser.name} />
       <span
         className="flex min-w-0 flex-1 flex-col"
         // The technical reason, when a window opened but can't be closed.
@@ -804,32 +864,5 @@ function LaunchStatus({
     <span className={good}>
       {privateWindow ? "Opened + incognito" : "Opened"}
     </span>
-  );
-}
-
-function BrowserIcon({ browser }: { browser: BrowserInfo }) {
-  const [failed, setFailed] = useState(false);
-
-  if (failed) {
-    return (
-      <span
-        aria-hidden="true"
-        className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-200 text-sm font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-      >
-        {browser.name.charAt(0)}
-      </span>
-    );
-  }
-
-  return (
-    <Image
-      src={`/api/browsers/${browser.id}/icon`}
-      alt=""
-      width={36}
-      height={36}
-      unoptimized
-      className="size-9 shrink-0"
-      onError={() => setFailed(true)}
-    />
   );
 }

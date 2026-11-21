@@ -38,7 +38,7 @@ ObjC.import("AppKit");
 // the app, never launches it. Together the two identify one run of the
 // browser, which is what a window id is only meaningful within.
 function runningApp(appPath) {
-  var none = { pid: 0, startedAt: 0 };
+  var none = { pid: 0, startedAt: 0, hidden: false };
   var bundle = $.NSBundle.bundleWithPath(appPath);
   if (bundle.isNil()) return none;
   var copies = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
@@ -53,7 +53,9 @@ function runningApp(appPath) {
     // being handed over. The one that has been running longest is the real
     // browser.
     var older = !best || (startedAt !== 0 && (best.startedAt === 0 || startedAt < best.startedAt));
-    if (older) best = { pid: copy.processIdentifier, startedAt: startedAt };
+    if (older) {
+      best = { pid: copy.processIdentifier, startedAt: startedAt, hidden: !!copy.hidden };
+    }
   }
   return best || none;
 }
@@ -297,27 +299,94 @@ function awaitNewWindows(request) {
   return windowList(request.appPath, fresh() || []);
 }
 
+function isMinimized(win) {
+  // The property has a different name in Chromium browsers.
+  try { return !!win.miniaturized(); } catch (e) {}
+  try { return !!win.minimized(); } catch (e) {}
+  return false;
+}
+
+// The window behind a handle, or null if it is gone.
+function windowFor(request, running, handle) {
+  // Window ids start over when a browser restarts, so a handle from an
+  // earlier run could now point at a window we never opened.
+  var sameRun = running.pid !== 0 && handle.pid === running.pid &&
+    handle.startedAt === running.startedAt;
+  if (!sameRun) return null;
+  var win = Application(request.appPath).windows.byId(handle.windowId);
+  if (!win.exists()) return null;
+  // Safari goes on listing a window for a while after it was closed, only no
+  // longer visible. Out of sight but neither in the Dock nor hidden along
+  // with the whole app means closed.
+  if (request.kind === "safari" && !running.hidden) {
+    var visible = true;
+    try { visible = win.visible(); } catch (e) {}
+    if (!visible && !isMinimized(win)) return null;
+  }
+  return win;
+}
+
 function closeWindows(request) {
   var running = runningApp(request.appPath);
   var closed = 0;
   var alreadyGone = 0;
   var stuck = 0;
   request.handles.forEach(function (handle) {
-    // Window ids start over when a browser restarts, so a handle from an
-    // earlier run could now point at a window we never opened.
-    var sameRun = running.pid !== 0 && handle.pid === running.pid &&
-      handle.startedAt === running.startedAt;
-    if (!sameRun) { alreadyGone++; return; }
-    var win = Application(request.appPath).windows.byId(handle.windowId);
-    if (!win.exists()) { alreadyGone++; return; }
+    var win = windowFor(request, running, handle);
+    if (!win) { alreadyGone++; return; }
     win.close();
-    // A page can ask "leave this site?" and keep its window open. Safari
-    // goes on listing a closed window for a while, only no longer visible.
+    // A page can ask "leave this site?" and keep its window open.
     var went = waitUntil(function () { return !win.exists() || !win.visible(); }, 3);
     if (went) closed++;
     else stuck++;
   });
   return { ok: true, closed: closed, alreadyGone: alreadyGone, stuck: stuck };
+}
+
+// What each window is showing right now, in the order the handles came in.
+function describeWindows(request) {
+  var running = runningApp(request.appPath);
+  var windows = request.handles.map(function (handle) {
+    var win = windowFor(request, running, handle);
+    if (!win) return { open: false };
+    var info = { open: true };
+    try {
+      if (request.kind === "chromium") {
+        info.title = win.activeTab.title();
+        info.url = win.activeTab.url();
+      } else if (request.kind === "safari") {
+        info.title = win.currentTab.name();
+        info.url = win.currentTab.url();
+      } else {
+        // Firefox only gives the window's name, which is the page title.
+        info.title = win.name();
+      }
+    } catch (error) {}
+    return info;
+  });
+  return { ok: true, windows: windows };
+}
+
+// Brings one window to the front of everything.
+function focusWindow(request) {
+  var running = runningApp(request.appPath);
+  var win = windowFor(request, running, request.handle);
+  if (!win) return { ok: true, gone: true };
+  if (isMinimized(win)) {
+    try { win.miniaturized = false; } catch (e) {
+      try { win.minimized = false; } catch (e2) {}
+    }
+  }
+  // Front of its own app first, then the app in front of the others.
+  try { win.index = 1; } catch (e) {}
+  var app = Application(request.appPath);
+  app.activate();
+  // Did it really end up in front of the browser's other windows?
+  var front = null;
+  try {
+    front = request.kind === "firefox" ? browserWindowIds(app)[0] : app.windows.id()[0];
+  } catch (e) {}
+  return { ok: true, gone: false, inFront: String(front) === String(request.handle.windowId) };
 }
 
 var ACTIONS = {
@@ -327,6 +396,8 @@ var ACTIONS = {
   "await-settled-windows": awaitSettledWindows,
   "await-new-windows": awaitNewWindows,
   "close-windows": closeWindows,
+  "describe-windows": describeWindows,
+  "focus-window": focusWindow,
 };
 
 function run(argv) {
@@ -527,6 +598,7 @@ export type CloseOutcome =
 
 /** Closes the windows behind `handles`, skipping any that no longer exist. */
 export async function closeTrackedWindows(
+  kind: ScriptingKind,
   appPath: string,
   handles: readonly WindowHandle[],
 ): Promise<CloseOutcome> {
@@ -536,6 +608,7 @@ export async function closeTrackedWindows(
     stuck: number;
   }>({
     action: "close-windows",
+    kind,
     appPath,
     handles,
   });
@@ -552,4 +625,63 @@ export async function closeTrackedWindows(
     alreadyGone: reply.alreadyGone,
     stuck: reply.stuck,
   };
+}
+
+/** What one tracked window is showing; `open: false` once it is gone. */
+export type WindowState = { open: boolean; title?: string; url?: string };
+
+export type DescribeOutcome =
+  | { ok: true; windows: WindowState[] }
+  | { ok: false; notAllowed: boolean; detail: string };
+
+/**
+ * Looks at the windows behind `handles` and says, in the same order, whether
+ * each is still open and what it is showing.
+ */
+export async function describeTrackedWindows(
+  kind: ScriptingKind,
+  appPath: string,
+  handles: readonly WindowHandle[],
+): Promise<DescribeOutcome> {
+  const reply = await script<{ windows: WindowState[] }>({
+    action: "describe-windows",
+    kind,
+    appPath,
+    handles,
+  });
+  if (!reply.ok) {
+    return {
+      ok: false,
+      notAllowed: reply.code === NOT_ALLOWED,
+      detail: reply.message,
+    };
+  }
+  return { ok: true, windows: reply.windows };
+}
+
+export type FocusOutcome =
+  /** `inFront`: the window is now ahead of the browser's other windows. */
+  | { ok: true; gone: boolean; inFront: boolean }
+  | { ok: false; notAllowed: boolean; detail: string };
+
+/** Brings the window behind `handle` to the front. */
+export async function focusTrackedWindow(
+  kind: ScriptingKind,
+  appPath: string,
+  handle: WindowHandle,
+): Promise<FocusOutcome> {
+  const reply = await script<{ gone: boolean; inFront?: boolean }>({
+    action: "focus-window",
+    kind,
+    appPath,
+    handle,
+  });
+  if (!reply.ok) {
+    return {
+      ok: false,
+      notAllowed: reply.code === NOT_ALLOWED,
+      detail: reply.message,
+    };
+  }
+  return { ok: true, gone: reply.gone, inFront: reply.inFront === true };
 }
