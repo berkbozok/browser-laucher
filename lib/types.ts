@@ -27,7 +27,7 @@ export type OpenRequest = {
 };
 
 /**
- * Identifies one window the launcher opened, so it can close it again later.
+ * Identifies one window the launcher opened, so it can find it again later.
  * A window id only means something within one run of the browser (ids start
  * over when it restarts), so the handle also says which run: the browser's
  * process id and the moment it was started.
@@ -38,10 +38,15 @@ export type WindowHandle = {
   pid: number;
   /** When that browser process started, in milliseconds since 1970. */
   startedAt: number;
+  /**
+   * macOS's own number for the window, which is what a picture of it is
+   * taken by. Null when it couldn't be worked out.
+   */
+  screenId?: number | null;
 };
 
 /**
- * Why a window that did open can't be closed by the launcher:
+ * Why a window that did open can't be listed or closed by the launcher:
  * - "unsupported":  the browser can't be controlled from outside at all;
  * - "not-allowed":  macOS hasn't given permission to control it;
  * - "unidentified": it opened, but we couldn't tell which window is ours.
@@ -61,9 +66,9 @@ export type OpenResult = {
   /** Whether the normal window opened. */
   ok: boolean;
   error?: string;
-  /** Present when the launcher can close the normal window again. */
+  /** Present when the launcher can find the normal window again. */
   handle?: WindowHandle;
-  /** Set when one of this browser's windows opened but can't be closed. */
+  /** Set when one of this browser's windows opened but can't be found again. */
   untracked?: Untracked;
   /** The technical reason behind `untracked`, for troubleshooting. */
   untrackedDetail?: string;
@@ -71,8 +76,49 @@ export type OpenResult = {
   privateWindow?: PrivateWindowResult;
 };
 
+export type OpenResponse = {
+  /** The URL that was actually opened, after normalisation. */
+  url: string;
+  /** When this launch happened, in milliseconds since 1970. */
+  openedAt: number;
+  results: OpenResult[];
+};
+
+/** One window the launcher has open right now, as the page shows it. */
+export type OpenWindow = {
+  /** Names this window when asking to show it or for a picture of it. */
+  key: string;
+  /** Id of the browser it belongs to. */
+  browser: string;
+  /** True for the incognito window of a launch. */
+  private: boolean;
+  /** The address it was opened on. */
+  openedUrl: string;
+  /**
+   * When it was opened, in milliseconds. The windows from one press of Open
+   * share the same value, which pairs a normal window with its incognito one.
+   */
+  launch: number;
+  /** The page's title, where the browser can tell us. */
+  title?: string;
+  /** The address it is on now, where the browser can tell us (not Firefox). */
+  url?: string;
+  /** Whether a live picture of the window can be asked for. */
+  hasPreview: boolean;
+};
+
+export type WindowsResponse = {
+  windows: OpenWindow[];
+  /**
+   * Whether macOS lets the launcher take pictures of windows (the Screen
+   * Recording permission). Null when that couldn't be found out.
+   */
+  mayCapture: boolean | null;
+};
+
+/** Close the launcher's windows in these browsers. */
 export type CloseRequest = {
-  windows: { browser: string; handles: WindowHandle[] }[];
+  browsers: string[];
 };
 
 export type CloseResult = {
@@ -88,41 +134,9 @@ export type CloseResponse = {
   results: CloseResult[];
 };
 
-export type OpenResponse = {
-  /** The URL that was actually opened, after normalisation. */
-  url: string;
-  /** When this launch happened, in milliseconds since 1970. */
-  openedAt: number;
-  results: OpenResult[];
-};
-
-/** Asks what the given windows are showing right now. */
-export type WindowsRequest = {
-  windows: { browser: string; handles: WindowHandle[] }[];
-};
-
-export type WindowStatus = {
-  /** False once the window is gone (closed, or its browser was quit). */
-  open: boolean;
-  /** The page's title, where the browser can tell us. */
-  title?: string;
-  /** The page's address, where the browser can tell us (not Firefox). */
-  url?: string;
-};
-
-export type WindowsResponse = {
-  results: {
-    id: string;
-    /** One entry per handle sent, in the same order. Absent on error. */
-    windows?: WindowStatus[];
-    error?: string;
-  }[];
-};
-
-/** Asks for one window to be brought to the front. */
+/** Bring one of the launcher's windows to the front. */
 export type FocusRequest = {
-  browser: string;
-  handle: WindowHandle;
+  key: string;
 };
 
 export type FocusResponse = {

@@ -3,13 +3,22 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { pictureOfWindow } from "./preview";
 import type {
   CloseResult,
+  FocusResponse,
   OpenResult,
+  OpenWindow,
   Untracked,
   WindowHandle,
   WindowsResponse,
 } from "./types";
+import {
+  forgetWindows,
+  listRegisteredWindows,
+  registerWindows,
+  type RegisteredWindow,
+} from "./window-registry";
 import {
   closeTrackedWindows,
   describeTrackedWindows,
@@ -409,7 +418,26 @@ export async function openInBrowsers(
     return result;
   };
 
-  return Promise.all([...new Set(ids)].map(openOne));
+  const launch = Date.now();
+  const results = await Promise.all([...new Set(ids)].map(openOne));
+
+  // Remember every window we can find again, so the page can list them,
+  // show them and close them, whether or not this reply reaches it.
+  await registerWindows(
+    results.flatMap((result) => {
+      const windows: Omit<RegisteredWindow, "key">[] = [];
+      const add = (handle: WindowHandle | undefined, isPrivate: boolean) => {
+        if (!handle) return;
+        windows.push({ browser: result.id, handle, private: isPrivate, url, launch });
+      };
+      add(result.handle, false);
+      if (result.privateWindow?.status === "opened") {
+        add(result.privateWindow.handle, true);
+      }
+      return windows;
+    }),
+  );
+  return results;
 }
 
 /**
@@ -426,18 +454,92 @@ function notAllowedMessage(name: string): string {
   return `macOS hasn't allowed the launcher to control ${name}. Allow it under System Settings → Privacy & Security → Automation.`;
 }
 
+function byBrowser(
+  windows: readonly RegisteredWindow[],
+): Map<string, RegisteredWindow[]> {
+  const groups = new Map<string, RegisteredWindow[]>();
+  for (const item of windows) {
+    const group = groups.get(item.browser);
+    if (group) group.push(item);
+    else groups.set(item.browser, [item]);
+  }
+  return groups;
+}
+
 /**
- * Closes windows the launcher opened earlier. Windows that are already gone
- * (closed by hand, or the browser was restarted) are counted, not treated as
- * errors.
+ * The launcher's windows that are still open, with what each is showing.
+ * Windows that turn out to be gone (closed by hand, browser quit) are
+ * forgotten along the way.
+ */
+export async function listOpenWindows(): Promise<WindowsResponse> {
+  const registered = await listRegisteredWindows();
+  if (registered.length === 0) return { windows: [], mayCapture: null };
+
+  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  const gone = new Set<string>();
+  let mayCapture: boolean | null = null;
+
+  const groups = await Promise.all(
+    [...byBrowser(registered)].map(async ([id, items]): Promise<OpenWindow[]> => {
+      const browser = detected.get(id);
+      if (!browser?.appPath || !browser.scripting) {
+        // The browser was removed. Nothing can be done with these any more.
+        items.forEach((item) => gone.add(item.key));
+        return [];
+      }
+      const outcome = await describeTrackedWindows(
+        browser.scripting,
+        browser.appPath,
+        items.map((item) => item.handle),
+      );
+      // No answer tells us nothing about the windows, so keep listing them
+      // as they were opened.
+      const states = outcome.ok ? outcome.windows : null;
+      if (outcome.ok && outcome.mayCapture !== null) {
+        mayCapture = mayCapture === true || outcome.mayCapture;
+      }
+      return items.flatMap((item, index): OpenWindow[] => {
+        const state = states?.[index];
+        if (state && !state.open) {
+          gone.add(item.key);
+          return [];
+        }
+        return [
+          {
+            key: item.key,
+            browser: id,
+            private: item.private,
+            openedUrl: item.url,
+            launch: item.launch,
+            title: state?.title,
+            url: state?.url,
+            hasPreview: typeof item.handle.screenId === "number",
+          },
+        ];
+      });
+    }),
+  );
+
+  await forgetWindows(gone);
+  return { windows: groups.flat(), mayCapture };
+}
+
+/**
+ * Closes the launcher's windows in the given browsers. Windows that are
+ * already gone (closed by hand, or the browser was restarted) are counted,
+ * not treated as errors.
  */
 export async function closeInBrowsers(
-  requests: readonly { browser: string; handles: readonly WindowHandle[] }[],
+  ids: readonly string[],
 ): Promise<CloseResult[]> {
   const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  const registered = byBrowser(await listRegisteredWindows());
+  const done = new Set<string>();
 
-  return Promise.all(
-    requests.map(async ({ browser: id, handles }): Promise<CloseResult> => {
+  const results = await Promise.all(
+    [...new Set(ids)].map(async (id): Promise<CloseResult | null> => {
+      const items = registered.get(id);
+      if (!items) return null; // Nothing of ours is open in this browser.
       const browser = detected.get(id);
       const name = browser?.name ?? id;
       const nothing = { id, name, closed: 0, alreadyGone: 0 };
@@ -448,7 +550,7 @@ export async function closeInBrowsers(
       const outcome = await closeTrackedWindows(
         browser.scripting,
         browser.appPath,
-        handles,
+        items.map((item) => item.handle),
       );
       if (!outcome.ok) {
         return {
@@ -456,78 +558,79 @@ export async function closeInBrowsers(
           error: outcome.notAllowed ? notAllowedMessage(name) : outcome.detail,
         };
       }
-      const counts = {
-        id,
-        name,
-        closed: outcome.closed,
-        alreadyGone: outcome.alreadyGone,
-      };
-      if (outcome.stuck === 0) return counts;
-      const those = outcome.stuck === 1 ? "One window" : `${outcome.stuck} windows`;
+
+      const count = (how: string) =>
+        outcome.outcomes.filter((o) => o === how).length;
+      // Windows that stayed open are kept on the list, so Close can be
+      // pressed again.
+      items.forEach((item, index) => {
+        if (outcome.outcomes[index] !== "stuck") done.add(item.key);
+      });
+      const counts = { id, name, closed: count("closed"), alreadyGone: count("gone") };
+      const stuck = count("stuck");
+      if (stuck === 0) return counts;
+      const those = stuck === 1 ? "One window" : `${stuck} windows`;
       return {
         ...counts,
-        error: `${those} stayed open; the page may be asking before it lets go. Close ${outcome.stuck === 1 ? "it" : "them"} by hand, or press Close again.`,
+        error: `${those} stayed open; the page may be asking before it lets go. Close ${stuck === 1 ? "it" : "them"} by hand, or press Close again.`,
       };
     }),
   );
+
+  await forgetWindows(done);
+  return results.filter((result) => result !== null);
+}
+
+async function findRegistered(key: string): Promise<{
+  item: RegisteredWindow;
+  appPath: string;
+  scripting: ScriptingKind;
+  name: string;
+} | null> {
+  const item = (await listRegisteredWindows()).find((w) => w.key === key);
+  if (!item) return null;
+  const browser = (await detectBrowsers()).find((b) => b.id === item.browser);
+  if (!browser?.appPath || !browser.scripting) return null;
+  return {
+    item,
+    appPath: browser.appPath,
+    scripting: browser.scripting,
+    name: browser.name,
+  };
 }
 
 /**
- * Says what each of the given windows is showing. Used by the page to keep
- * its list of open windows current.
+ * Brings one of the launcher's windows to the front. Throws with a message
+ * for the person when the browser can't be reached.
  */
-export async function describeInBrowsers(
-  requests: readonly { browser: string; handles: readonly WindowHandle[] }[],
-): Promise<WindowsResponse["results"]> {
-  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+export async function focusOpenWindow(key: string): Promise<FocusResponse> {
+  const found = await findRegistered(key);
+  if (!found) return { gone: true, inFront: false };
 
-  return Promise.all(
-    requests.map(async ({ browser: id, handles }) => {
-      const browser = detected.get(id);
-      if (!browser?.appPath || !browser.scripting) {
-        return { id, error: "This browser's windows can't be looked at from here." };
-      }
-      const outcome = await describeTrackedWindows(
-        browser.scripting,
-        browser.appPath,
-        handles,
-      );
-      if (!outcome.ok) {
-        return {
-          id,
-          error: outcome.notAllowed
-            ? notAllowedMessage(browser.name)
-            : outcome.detail,
-        };
-      }
-      return { id, windows: outcome.windows };
-    }),
-  );
-}
-
-/**
- * Brings one window to the front. Resolves to whether it was still there;
- * throws with a message for the person when the browser can't be reached.
- */
-export async function focusInBrowser(
-  id: string,
-  handle: WindowHandle,
-): Promise<{ gone: boolean; inFront: boolean }> {
-  const browser = (await detectBrowsers()).find((b) => b.id === id);
-  if (!browser?.appPath || !browser.scripting) {
-    throw new Error("This browser's windows can't be brought forward from here.");
-  }
   const outcome = await focusTrackedWindow(
-    browser.scripting,
-    browser.appPath,
-    handle,
+    found.scripting,
+    found.appPath,
+    found.item.handle,
   );
   if (!outcome.ok) {
     throw new Error(
-      outcome.notAllowed ? notAllowedMessage(browser.name) : outcome.detail,
+      outcome.notAllowed ? notAllowedMessage(found.name) : outcome.detail,
     );
   }
+  if (outcome.gone) await forgetWindows(new Set([key]));
   return { gone: outcome.gone, inFront: outcome.inFront };
+}
+
+/**
+ * A JPEG of one of the launcher's windows as it looks right now, or null if
+ * there is none to be had. Only windows the launcher opened can be asked
+ * for; nothing else on the screen is reachable through this.
+ */
+export async function pictureOfOpenWindow(key: string): Promise<Buffer | null> {
+  const item = (await listRegisteredWindows()).find((w) => w.key === key);
+  const screenId = item?.handle.screenId;
+  if (typeof screenId !== "number") return null;
+  return pictureOfWindow(screenId);
 }
 
 async function renderIcon(appPath: string): Promise<Buffer> {

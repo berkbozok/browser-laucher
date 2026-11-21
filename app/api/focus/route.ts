@@ -1,15 +1,13 @@
-import { badRequest, readHandle, readOwnJson } from "@/lib/api-request";
-import { focusInBrowser, isSupportedPlatform } from "@/lib/browsers";
-import type { FocusResponse } from "@/lib/types";
+import { badRequest, readOwnJson } from "@/lib/api-request";
+import { focusOpenWindow, isSupportedPlatform } from "@/lib/browsers";
 
 /** Brings one of the launcher's windows to the front. */
 export async function POST(request: Request) {
   const body = await readOwnJson(request);
   if ("rejection" in body) return body.rejection;
 
-  const { browser } = body.payload;
-  const handle = readHandle(body.payload.handle);
-  if (typeof browser !== "string" || !handle) {
+  const { key } = body.payload;
+  if (typeof key !== "string" || key.length === 0 || key.length > 200) {
     return badRequest("Say which window to show.");
   }
 
@@ -18,8 +16,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const response: FocusResponse = await focusInBrowser(browser, handle);
-    return Response.json(response);
+    return Response.json(await focusOpenWindow(key));
   } catch (error) {
     return badRequest(
       error instanceof Error ? error.message : "That window couldn't be shown.",

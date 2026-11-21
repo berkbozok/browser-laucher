@@ -32,6 +32,7 @@ const SCRIPT_TIMEOUT_MS = 60_000;
  */
 const SCRIPT = String.raw`
 ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
 
 // The running browser: its process id and the moment it was started, or pid
 // 0 when it isn't running. Asking needs no permission and, unlike talking to
@@ -64,10 +65,57 @@ function pidOf(appPath) {
   return runningApp(appPath).pid;
 }
 
+// Every ordinary window of a process as the window server lists it, front
+// to back. Any app may read this.
+function onScreenWindows(pid) {
+  var info = $.CGWindowListCopyWindowInfo(1 | 16, 0);
+  return ObjC.deepUnwrap(ObjC.castRefToObject(info)).filter(function (w) {
+    return w.kCGWindowOwnerPID === pid && w.kCGWindowLayer === 0;
+  });
+}
+
+// The window server's number for one of the browser's windows, which is
+// what a picture of the window is taken by. Null if it can't be pinned down.
+function screenIdOf(request, windowId) {
+  var listed = onScreenWindows(pidOf(request.appPath));
+  if (request.kind !== "chromium") {
+    // Safari and Firefox use the window server's number as the window's id.
+    return listed.some(function (w) { return w.kCGWindowNumber === windowId; }) ? windowId : null;
+  }
+  // Chromium browsers number their windows themselves, so match on where the
+  // window is. Ours was just made, so it is the frontmost one in that spot.
+  var at = Application(request.appPath).windows.byId(windowId).bounds();
+  for (var i = 0; i < listed.length; i++) {
+    var b = listed[i].kCGWindowBounds;
+    if (b.X === at.x && b.Y === at.y && b.Width === at.width && b.Height === at.height) {
+      return listed[i].kCGWindowNumber;
+    }
+  }
+  return null;
+}
+
 // The reply for a window that is now open and can be found again.
-function opened(appPath, windowId) {
-  var app = runningApp(appPath);
-  return { ok: true, windowId: windowId, pid: app.pid, startedAt: app.startedAt };
+function opened(request, windowId) {
+  var app = runningApp(request.appPath);
+  var screenId = waitUntil(function () { return screenIdOf(request, windowId); }, 2);
+  return {
+    ok: true,
+    windowId: windowId,
+    pid: app.pid,
+    startedAt: app.startedAt,
+    screenId: screenId,
+  };
+}
+
+// Whether this process may take pictures of other apps' windows (the Screen
+// Recording permission). Asking doesn't bring up the permission prompt.
+function mayCapture() {
+  try {
+    ObjC.bindFunction("CGPreflightScreenCaptureAccess", ["bool", []]);
+    return !!$.CGPreflightScreenCaptureAccess();
+  } catch (error) {
+    return null;
+  }
 }
 
 function waitUntil(test, seconds) {
@@ -142,9 +190,14 @@ function openChromium(request) {
       };
     }
   }
-  app.windows.byId(id).activeTab.url = request.url;
+  // A window that was made an instant ago may not have its tab yet.
+  var loaded = waitUntil(function () {
+    app.windows.byId(id).activeTab.url = request.url;
+    return true;
+  }, 4);
+  if (!loaded) throw new Error("The new window never became ready for an address.");
   app.activate();
-  return opened(request.appPath, id);
+  return opened(request, id);
 }
 
 function safariBlankWindow(app) {
@@ -200,7 +253,7 @@ function openSafariPrivate(app, request) {
     return { ok: false, code: null, message: "Safari didn't open a private window." };
   }
   app.windows.byId(fresh[0]).currentTab.url = request.url;
-  return opened(request.appPath, fresh[0]);
+  return opened(request, fresh[0]);
 }
 
 function openSafari(request) {
@@ -230,7 +283,7 @@ function openSafari(request) {
     id = fresh[0];
   }
   app.activate();
-  return opened(request.appPath, id);
+  return opened(request, id);
 }
 
 // Ids of the real browser windows, ignoring panels and tooltips. Each property
@@ -328,19 +381,16 @@ function windowFor(request, running, handle) {
 
 function closeWindows(request) {
   var running = runningApp(request.appPath);
-  var closed = 0;
-  var alreadyGone = 0;
-  var stuck = 0;
-  request.handles.forEach(function (handle) {
+  // One of "closed", "gone" or "stuck" per handle, in the order they came.
+  var outcomes = request.handles.map(function (handle) {
     var win = windowFor(request, running, handle);
-    if (!win) { alreadyGone++; return; }
+    if (!win) return "gone";
     win.close();
     // A page can ask "leave this site?" and keep its window open.
     var went = waitUntil(function () { return !win.exists() || !win.visible(); }, 3);
-    if (went) closed++;
-    else stuck++;
+    return went ? "closed" : "stuck";
   });
-  return { ok: true, closed: closed, alreadyGone: alreadyGone, stuck: stuck };
+  return { ok: true, outcomes: outcomes };
 }
 
 // What each window is showing right now, in the order the handles came in.
@@ -364,7 +414,7 @@ function describeWindows(request) {
     } catch (error) {}
     return info;
   });
-  return { ok: true, windows: windows };
+  return { ok: true, windows: windows, mayCapture: mayCapture() };
 }
 
 // Brings one window to the front of everything.
@@ -531,6 +581,8 @@ async function openByWatchingWindows(
         windowId: after.ids[0],
         pid: after.pid,
         startedAt: after.startedAt,
+        // Firefox uses the window server's number as the window's id.
+        screenId: after.ids[0],
       },
     };
   }
@@ -567,6 +619,7 @@ export async function openTrackedWindow(options: {
     WindowHandle | { windowId?: undefined; unidentified: string }
   >({
     action: kind === "safari" ? "open-safari" : "open-chromium",
+    kind,
     appPath,
     url,
     private: options.private,
@@ -582,18 +635,17 @@ export async function openTrackedWindow(options: {
       windowId: reply.windowId,
       pid: reply.pid,
       startedAt: reply.startedAt,
+      screenId: reply.screenId ?? null,
     },
   };
 }
 
+/** "stuck": asked to close, but stayed open. */
+export type ClosedHow = "closed" | "gone" | "stuck";
+
 export type CloseOutcome =
-  | {
-      ok: true;
-      closed: number;
-      alreadyGone: number;
-      /** Windows that were asked to close but stayed open. */
-      stuck: number;
-    }
+  /** One entry per handle, in the order they were given. */
+  | { ok: true; outcomes: ClosedHow[] }
   | { ok: false; notAllowed: boolean; detail: string };
 
 /** Closes the windows behind `handles`, skipping any that no longer exist. */
@@ -602,11 +654,7 @@ export async function closeTrackedWindows(
   appPath: string,
   handles: readonly WindowHandle[],
 ): Promise<CloseOutcome> {
-  const reply = await script<{
-    closed: number;
-    alreadyGone: number;
-    stuck: number;
-  }>({
+  const reply = await script<{ outcomes: ClosedHow[] }>({
     action: "close-windows",
     kind,
     appPath,
@@ -619,19 +667,15 @@ export async function closeTrackedWindows(
       detail: reply.message,
     };
   }
-  return {
-    ok: true,
-    closed: reply.closed,
-    alreadyGone: reply.alreadyGone,
-    stuck: reply.stuck,
-  };
+  return { ok: true, outcomes: reply.outcomes };
 }
 
 /** What one tracked window is showing; `open: false` once it is gone. */
 export type WindowState = { open: boolean; title?: string; url?: string };
 
 export type DescribeOutcome =
-  | { ok: true; windows: WindowState[] }
+  /** `mayCapture`: pictures of windows are allowed (null if unknown). */
+  | { ok: true; windows: WindowState[]; mayCapture: boolean | null }
   | { ok: false; notAllowed: boolean; detail: string };
 
 /**
@@ -643,7 +687,10 @@ export async function describeTrackedWindows(
   appPath: string,
   handles: readonly WindowHandle[],
 ): Promise<DescribeOutcome> {
-  const reply = await script<{ windows: WindowState[] }>({
+  const reply = await script<{
+    windows: WindowState[];
+    mayCapture: boolean | null;
+  }>({
     action: "describe-windows",
     kind,
     appPath,
@@ -656,7 +703,7 @@ export async function describeTrackedWindows(
       detail: reply.message,
     };
   }
-  return { ok: true, windows: reply.windows };
+  return { ok: true, windows: reply.windows, mayCapture: reply.mayCapture };
 }
 
 export type FocusOutcome =

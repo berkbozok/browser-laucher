@@ -18,10 +18,17 @@ the normal one, in every browser that can do it (see the table under Limits).
 
 After you press Open, an **Open windows** list appears: one line per browser,
 its normal window on the left and its incognito window on the right. Each box
-shows the page that window is on right now (title and address; Firefox only
-gives the title) and is refreshed every few seconds, so you can watch all of
-them from one place. Click a box to bring that window to the front. A window
-you close yourself drops off the list.
+is a live picture of that window, retaken every couple of seconds, with the
+page's title and address underneath (Firefox only gives the title). So you
+can watch all of them from one place, even the ones hidden behind other
+windows. Click a box to bring that window to the front. A window you close
+yourself drops off the list.
+
+Live pictures need macOS's **Screen Recording** permission for the app that
+runs the server: System Settings → Privacy & Security → Screen & System Audio
+Recording. macOS asks you to quit and reopen that app afterwards. Without it
+the boxes show the title and address only, and the page tells you what to
+switch on.
 
 **Close** shuts the windows the launcher opened, and only those, in the
 browsers that are ticked at that moment. Untick a browser first to keep its
@@ -45,11 +52,13 @@ A web page can't start other apps, so the page asks the Node.js server to do it.
 | `lib/local-request.ts` | Refuses API calls that don't come from the launcher's own page. |
 | `app/api/browsers` | `GET` the browsers and whether each is installed. `…/[id]/icon` serves the app's icon. |
 | `app/api/open` | `POST { url, browsers, includePrivate? }` to open the URL. Returns a result per browser, including how its private window went. |
-| `app/api/close` | `POST { windows }` with the handles from `/api/open` to close those windows. |
-| `app/api/windows` | `POST { windows }` to ask what those windows are showing right now. |
-| `app/api/focus` | `POST { browser, handle }` to bring one window to the front. |
-| `lib/api-request.ts` | The checks every POST route starts with, and reading window handles out of a request. |
-| `lib/tracked-windows.ts` | How the page remembers the windows it opened. |
+| `app/api/windows` | `GET` the launcher's open windows and what each is showing right now. |
+| `app/api/preview/[key]` | `GET` a picture of one of those windows. |
+| `app/api/focus` | `POST { key }` to bring one of them to the front. |
+| `app/api/close` | `POST { browsers }` to close the launcher's windows in those browsers. |
+| `lib/window-registry.ts` | The server's list of the windows it opened, kept in a small file so it survives reloads. |
+| `lib/preview.ts` | Takes the pictures. |
+| `lib/api-request.ts` | The checks every POST route starts with. |
 | `components/open-windows.tsx` | The Open windows list. |
 | `components/launcher.tsx` | The page: URL field, browser cards, results. |
 
@@ -95,6 +104,7 @@ a normal window while the launcher reports it as private.
   whatever it wants (a home page, your last session); only then does the
   launcher add its own window. If it still can't tell which window is its
   own, it leaves them all alone and says so.
-- **The page remembers which windows are open**, in the browser tab you used.
-  If you reload it while an Open is still running, or use the launcher from a
-  second tab, those windows are simply ones you close yourself.
+- **The server remembers which windows it opened**, in a small file in the
+  system's temporary folder. The page only shows that list, so a reload, a
+  second tab or a reply that went missing doesn't lose track of anything.
+  Only those windows can be shown, pictured or closed through the API.
