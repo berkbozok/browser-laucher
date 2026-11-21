@@ -63,6 +63,9 @@ a normal window while the launcher reports it as private.
   launcher recognises its window as the one that appeared right after it
   asked; if several appear at once (Firefox restoring a session as it starts)
   it leaves them all alone and tells you.
-- **Private windows depend on the browser.** Chrome, Brave, Firefox, Opera and
-  Edge have a command-line switch for one. Safari doesn't, so it only ever
-  gets a normal window.
+- **Safari's private window needs one more permission.** Safari has no command
+  for a private window, so the launcher presses Safari's own
+  *File → New Private Window* for you. For that, turn on the app running the
+  server under System Settings → Privacy & Security → Accessibility, and click
+  Allow when macOS asks about "System Events". Until then Safari opens its
+  normal window only and the page tells you what's missing.

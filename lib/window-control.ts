@@ -8,7 +8,9 @@ const run = promisify(execFile);
  * How a browser can be driven from outside through macOS scripting:
  *
  * - "chromium": can create normal and incognito windows and say which is which.
- * - "safari":   can create normal windows only.
+ * - "safari":   can create normal windows. A private one is made by pressing
+ *               Safari's own menu item, which needs the Accessibility
+ *               permission on top.
  * - "firefox":  can only list and close windows. Its windows are opened on
  *               the command line and then picked out as "the one window that
  *               wasn't there before".
@@ -120,11 +122,57 @@ function safariBlankWindow(app) {
   return windows[0].id();
 }
 
+// Safari has no command for a private window, so this presses its own
+// File > New Private Window. The item is found by its shortcut (Shift-Command-N)
+// rather than its title, which changes with the system language. Pressing a
+// menu item in another app is what needs the Accessibility permission.
+function pressSafariNewPrivateWindow(app, appPath) {
+  var process = Application("System Events").processes.whose({
+    unixId: pidOf(appPath),
+  })[0];
+  var items = process.menuBars[0].menuBarItems[2].menus[0].menuItems;
+  var keys = items.attributes.byName("AXMenuItemCmdChar").value();
+  var modifiers = items.attributes.byName("AXMenuItemCmdModifiers").value();
+  for (var i = 0; i < keys.length; i++) {
+    // Modifiers value 1 is Shift together with Command.
+    if (String(keys[i]).toUpperCase() === "N" && modifiers[i] === 1) {
+      app.activate();
+      items[i].click();
+      return true;
+    }
+  }
+  return false;
+}
+
+function openSafariPrivate(app, request) {
+  var before = app.windows.id();
+  try {
+    if (!pressSafariNewPrivateWindow(app, request.appPath)) {
+      return { ok: false, code: null, message: "Safari's New Private Window menu item wasn't found." };
+    }
+  } catch (error) {
+    if (error.errorNumber === -1743) throw error;
+    return { ok: false, code: null, needsAccessibility: true, message: String(error.message || error) };
+  }
+  var fresh = waitUntil(function () {
+    var ids = app.windows.id().filter(function (id) { return before.indexOf(id) === -1; });
+    return ids.length === 1 ? ids : null;
+  }, 6);
+  if (!fresh) {
+    return { ok: false, code: null, message: "Safari didn't open a private window." };
+  }
+  app.windows.byId(fresh[0]).currentTab.url = request.url;
+  return { ok: true, windowId: fresh[0], pid: pidOf(request.appPath) };
+}
+
 function openSafari(request) {
   var app = Application(request.appPath);
   var id = null;
-  if (pidOf(request.appPath) === 0) {
-    coldStart(app);
+  var wasClosed = pidOf(request.appPath) === 0;
+  if (wasClosed) coldStart(app);
+  if (request.private) return openSafariPrivate(app, request);
+
+  if (wasClosed) {
     id = safariBlankWindow(app);
     if (id !== null) app.windows.byId(id).currentTab.url = request.url;
   }
@@ -214,7 +262,13 @@ function run(argv) {
 }
 `;
 
-type Failure = { ok: false; code: number | null; message: string };
+type Failure = {
+  ok: false;
+  code: number | null;
+  message: string;
+  /** The step that failed needs the macOS Accessibility permission. */
+  needsAccessibility?: boolean;
+};
 type Reply<T> = ({ ok: true } & T) | Failure;
 
 async function script<T>(request: Record<string, unknown>): Promise<Reply<T>> {
@@ -243,12 +297,20 @@ export type TrackedOpen =
   /** The window is open, but we couldn't tell which one it is. */
   | { opened: true; handle: null; detail: string }
   /** Nothing was opened this way; the caller should open the page plainly. */
-  | { opened: false; notAllowed: boolean; detail: string };
+  | {
+      opened: false;
+      /** macOS hasn't allowed the launcher to control this browser. */
+      notAllowed: boolean;
+      /** The Accessibility permission is what's missing. */
+      needsAccessibility: boolean;
+      detail: string;
+    };
 
 function refused(failure: Failure): TrackedOpen {
   return {
     opened: false,
     notAllowed: failure.code === NOT_ALLOWED,
+    needsAccessibility: failure.needsAccessibility === true,
     detail: failure.message,
   };
 }

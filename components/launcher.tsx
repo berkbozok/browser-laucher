@@ -166,6 +166,16 @@ function summarizeOpen(results: OpenResult[]): Notice | null {
     }
   }
 
+  // Say why, for each window that didn't open.
+  for (const result of results) {
+    if (!result.ok && result.error) {
+      parts.push(`${result.name}: ${result.error}`);
+    }
+    if (result.privateWindow?.status === "failed") {
+      parts.push(`${result.name}: ${result.privateWindow.error}`);
+    }
+  }
+
   // Windows that opened but that the Close button won't be able to reach.
   const notAllowed = namesWhere((r) => r.untracked === "not-allowed");
   if (notAllowed.length > 0) {

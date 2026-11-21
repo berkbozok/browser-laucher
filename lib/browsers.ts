@@ -158,6 +158,8 @@ export type DetectedBrowser = {
   appPath: string | null;
   /** Switch for opening a private window, or null when the browser has none. */
   privateFlag: string | null;
+  /** Whether a private window can be opened at all, by switch or otherwise. */
+  supportsPrivate: boolean;
   /** See BrowserDefinition.linksFollowLastWindow. */
   linksFollowLastWindow: boolean;
   /** See BrowserDefinition.scripting. */
@@ -198,6 +200,10 @@ export async function detectBrowsers(): Promise<DetectedBrowser[]> {
       name: definition.name,
       appPath: isSupportedPlatform ? await findApp(definition.macApps) : null,
       privateFlag: definition.privateFlag ?? null,
+      // Safari has no switch, but its menu can be pressed (see window-control).
+      supportsPrivate:
+        definition.privateFlag !== undefined ||
+        definition.scripting === "safari",
       linksFollowLastWindow: definition.linksFollowLastWindow ?? false,
       scripting: definition.scripting ?? null,
     })),
@@ -268,30 +274,44 @@ type WindowOutcome =
   | { ok: false; error: string };
 
 /**
- * Opens one window, normal or private (pass the browser's private switch for
- * the latter). It is opened in a way the launcher can close again whenever
- * the browser allows that; `track: false` skips straight to the fallback.
+ * Opens one window, normal or private. It is opened in a way the launcher
+ * can close again whenever the browser allows that; `track: false` skips
+ * straight to the fallback.
  */
 async function openWindow(
   browser: InstalledBrowser,
   url: string,
-  { privateFlag, track }: { privateFlag: string | null; track: boolean },
+  { isPrivate, track }: { isPrivate: boolean; track: boolean },
 ): Promise<WindowOutcome> {
+  const privateFlag = isPrivate ? browser.privateFlag : null;
+  // A private window with no switch to fall back on (Safari) can only be
+  // made through scripting.
+  const scriptingOnly = isPrivate && privateFlag === null;
+
   let untracked: Untracked = "unsupported";
   let detail: string | undefined;
   try {
-    if (browser.scripting && track) {
+    if (browser.scripting && (track || scriptingOnly)) {
       const tracked = await openTrackedWindow({
         kind: browser.scripting,
         appPath: browser.appPath,
         url,
-        private: privateFlag !== null,
+        private: isPrivate,
         commandLine: firefoxSteps(browser.appPath, url, privateFlag),
       });
       if (tracked.opened) {
         return tracked.handle
           ? { ok: true, handle: tracked.handle }
           : { ok: true, untracked: "unidentified", detail: tracked.detail };
+      }
+      if (scriptingOnly) {
+        return {
+          ok: false,
+          error:
+            tracked.needsAccessibility || tracked.notAllowed
+              ? menuPermissionMessage(browser.name)
+              : tracked.detail,
+        };
       }
       untracked = tracked.notAllowed ? "not-allowed" : "unidentified";
       detail = tracked.detail;
@@ -331,7 +351,7 @@ export async function openInBrowsers(
       const browser: InstalledBrowser = { ...found, appPath };
 
       const normal = await openWindow(browser, url, {
-        privateFlag: null,
+        isPrivate: false,
         track: true,
       });
       const result: OpenResult = normal.ok
@@ -348,11 +368,11 @@ export async function openInBrowsers(
       // The normal window goes first so a browser that wasn't running is
       // already up by the time the private window is requested.
       if (includePrivate) {
-        if (!browser.privateFlag) {
+        if (!browser.supportsPrivate) {
           result.privateWindow = { status: "unsupported" };
         } else {
           const extra = await openWindow(browser, url, {
-            privateFlag: browser.privateFlag,
+            isPrivate: true,
             // Don't sit through a second unanswered permission prompt.
             track: result.untracked !== "not-allowed",
           });
@@ -365,6 +385,15 @@ export async function openInBrowsers(
       return result;
     }),
   );
+}
+
+/**
+ * For a private window that can only be made by pressing the browser's menu.
+ * macOS guards that with two permissions, and a refusal or an unanswered
+ * prompt for either one looks the same from here.
+ */
+function menuPermissionMessage(name: string): string {
+  return `${name} only opens a private window when the launcher presses its menu, and macOS has to allow that. Click Allow if it asks about “System Events”, and turn on the app running the launcher (Terminal, Cursor, …) under System Settings → Privacy & Security → Accessibility. Then try again.`;
 }
 
 /** What to tell someone when macOS is what stands between us and a browser. */
