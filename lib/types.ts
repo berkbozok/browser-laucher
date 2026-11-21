@@ -6,6 +6,11 @@ export type BrowserInfo = {
   installed: boolean;
   /** Whether this browser can be told to open a private (incognito) window. */
   supportsPrivate: boolean;
+  /**
+   * True when that private window only works after the person has switched
+   * on the macOS Accessibility permission (Safari).
+   */
+  needsAccessibility: boolean;
 };
 
 export type BrowsersResponse = {

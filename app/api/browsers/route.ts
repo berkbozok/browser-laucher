@@ -9,11 +9,13 @@ export async function GET(request: Request) {
   const detected = await detectBrowsers();
   const body: BrowsersResponse = {
     supported: isSupportedPlatform,
-    browsers: detected.map(({ id, name, appPath, supportsPrivate }) => ({
-      id,
-      name,
-      installed: appPath !== null,
-      supportsPrivate,
+    browsers: detected.map((browser) => ({
+      id: browser.id,
+      name: browser.name,
+      installed: browser.appPath !== null,
+      supportsPrivate: browser.supportsPrivate,
+      // Pressing another app's menu is what macOS guards with Accessibility.
+      needsAccessibility: browser.privateViaMenu,
     })),
   };
   return Response.json(body);

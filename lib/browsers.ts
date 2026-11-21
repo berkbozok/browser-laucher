@@ -160,6 +160,8 @@ export type DetectedBrowser = {
   privateFlag: string | null;
   /** Whether a private window can be opened at all, by switch or otherwise. */
   supportsPrivate: boolean;
+  /** The private window is made by pressing the browser's menu (Safari). */
+  privateViaMenu: boolean;
   /** See BrowserDefinition.linksFollowLastWindow. */
   linksFollowLastWindow: boolean;
   /** See BrowserDefinition.scripting. */
@@ -204,6 +206,7 @@ export async function detectBrowsers(): Promise<DetectedBrowser[]> {
       supportsPrivate:
         definition.privateFlag !== undefined ||
         definition.scripting === "safari",
+      privateViaMenu: definition.scripting === "safari",
       linksFollowLastWindow: definition.linksFollowLastWindow ?? false,
       scripting: definition.scripting ?? null,
     })),

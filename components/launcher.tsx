@@ -304,6 +304,9 @@ export function Launcher() {
     return handles.length > 0 ? [{ browser: browser.id, handles }] : [];
   });
   const closableCount = closable.reduce((sum, c) => sum + c.handles.length, 0);
+  const needSetup = chosen
+    .filter((browser) => browser.needsAccessibility)
+    .map((browser) => browser.name);
 
   function rescan() {
     setScanning(true);
@@ -599,6 +602,38 @@ export function Launcher() {
             ))}
           </ul>
         )}
+
+        {needSetup.length > 0 ? (
+          <p
+            role="note"
+            className="flex gap-2.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200"
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+              className="mt-0.5 size-4 shrink-0"
+            >
+              <path
+                fillRule="evenodd"
+                clipRule="evenodd"
+                d="M8.5 2.9a1.75 1.75 0 0 1 3 0l6.3 10.9a1.75 1.75 0 0 1-1.5 2.6H3.7a1.75 1.75 0 0 1-1.5-2.6L8.5 2.9ZM10 7a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 10 7Zm0 7.5a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"
+              />
+            </svg>
+            <span>
+              <strong className="font-semibold">
+                {nameList.format(needSetup)}{" "}
+                {needSetup.length === 1 ? "needs" : "need"} a one-time setup
+                for incognito.
+              </strong>{" "}
+              In System Settings → Privacy &amp; Security → Accessibility, turn
+              on the app that runs this launcher (Terminal, Cursor, …), and
+              click Allow if macOS asks about “System Events”. Until then,{" "}
+              {nameList.format(needSetup)}{" "}
+              {needSetup.length === 1 ? "opens" : "open"} a normal window only.
+            </span>
+          </p>
+        ) : null}
 
         {data?.supported && missing.length > 0 ? (
           <p className="text-xs leading-relaxed text-zinc-500 dark:text-zinc-500">
