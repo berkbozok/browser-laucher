@@ -3,6 +3,7 @@ import { rejectUnlessLocal } from "@/lib/local-request";
 import type { CloseResponse, WindowHandle } from "@/lib/types";
 
 const MAX_BROWSERS = 50;
+/** Keep in step with MAX_TRACKED_PER_BROWSER in components/launcher.tsx. */
 const MAX_WINDOWS_PER_BROWSER = 200;
 
 function badRequest(error: string, status = 400): Response {
@@ -11,11 +12,13 @@ function badRequest(error: string, status = 400): Response {
 
 function isHandle(value: unknown): value is WindowHandle {
   if (typeof value !== "object" || value === null) return false;
-  const { windowId, pid } = value as Record<string, unknown>;
+  const { windowId, pid, startedAt } = value as Record<string, unknown>;
   const validId =
     Number.isSafeInteger(windowId) ||
     (typeof windowId === "string" && /^[\w-]{1,64}$/.test(windowId));
-  return validId && Number.isSafeInteger(pid);
+  return (
+    validId && Number.isSafeInteger(pid) && Number.isSafeInteger(startedAt)
+  );
 }
 
 function isCloseEntry(
@@ -64,13 +67,17 @@ export async function POST(request: Request) {
     return badRequest("Closing windows is only supported on macOS for now.", 501);
   }
 
-  // Each handle carries just the two numbers; nothing else from the request
-  // reaches the browser.
+  // Only the three checked fields of each handle are passed on; nothing else
+  // from the request reaches the browser.
   const body: CloseResponse = {
     results: await closeInBrowsers(
       windows.map(({ browser, handles }) => ({
         browser,
-        handles: handles.map(({ windowId, pid }) => ({ windowId, pid })),
+        handles: handles.map(({ windowId, pid, startedAt }) => ({
+          windowId,
+          pid,
+          startedAt,
+        })),
       })),
     ),
   };

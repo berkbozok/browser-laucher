@@ -13,8 +13,8 @@ npm run dev
 Then open <http://127.0.0.1:3000>. Type a URL, tick the browsers, press
 **Open**. Your last URL and selection are remembered.
 
-Turn on **Also open in incognito** to get a second, private window in each
-browser as well as the normal one.
+Turn on **Also open in incognito** to get a second, private window as well as
+the normal one, in every browser that can do it (see the table under Limits).
 
 **Close** shuts the windows the launcher opened, and only those, in the
 browsers that are ticked at that moment. Untick a browser first to keep its
@@ -51,27 +51,38 @@ a normal window while the launcher reports it as private.
 ## Limits
 
 - **macOS only for now.** Browsers are found in `/Applications` and
-  `~/Applications` and opened with the system `open` command.
-- **Local only.** The server listens on `127.0.0.1`, and the API rejects
-  requests from other sites or other hostnames, because it launches apps on
-  the machine it runs on.
+  `~/Applications`, and driven through macOS scripting where they allow it.
+- **Local only.** Start it with `npm run dev` or `npm start`: those make the
+  server listen on `127.0.0.1` alone. The API also rejects requests from
+  other sites or other hostnames, because it launches apps on the machine it
+  runs on. Don't run it on an address other machines can reach.
 - Only `http://` and `https://` addresses are opened.
-- **Each page gets its own window**, not a tab in a window you already had,
-  so that closing it can't take anything of yours with it.
-- **Closing depends on the browser too.** Chrome, Brave, Edge, Opera, Vivaldi,
-  Safari, DuckDuckGo, Firefox and Zen are supported; Orion and Arc are not yet
-  (their windows open, but you close them yourself). Firefox can't say what a window contains, so the
-  launcher recognises its window as the one that appeared right after it
-  asked; if several appear at once (Firefox restoring a session as it starts)
-  it leaves them all alone and tells you.
-- **Safari and DuckDuckGo need one more permission.** Neither has a command
-  for a private window, so the launcher presses the browser's own menu item
-  for you (*New Private Window* in Safari, *New Fire Window* in DuckDuckGo).
-  For that, turn on the app running the server under System Settings →
-  Privacy & Security → Accessibility, and click Allow when macOS asks about
-  "System Events". Until then they open a normal window only, and the page
-  shows a reminder while either one is ticked.
-- **DuckDuckGo is driven like a person would.** It can't be scripted at all,
-  so the launcher also fills in its address bar and presses Return, and
-  closes its windows by pressing their close button. It goes last, after the
-  other browsers, so that key press can't land in another app.
+- **What each browser can do**
+
+  | Browser | Normal window | Incognito window | Close |
+  | --- | --- | --- | --- |
+  | Chrome, Brave, Edge, Opera, Vivaldi | yes | yes | yes |
+  | Firefox, Zen | yes | yes | yes |
+  | Safari | yes | yes, after a one-time setup | yes |
+  | DuckDuckGo, Orion, Arc, Tor Browser | yes | no | by hand |
+
+- **Where Close works, each page gets its own window**, not a tab in a window
+  you already had, so that closing it can't take anything of yours with it.
+  The browsers in the last row just get the page handed to them and put it
+  wherever they like. DuckDuckGo, for one, switches to a tab that already
+  shows that address instead of loading it again.
+- **Safari's incognito window needs one more permission.** Safari has no
+  command for a private window, so the launcher presses Safari's own
+  *File → New Private Window* for you. For that, turn on the app running the
+  server under System Settings → Privacy & Security → Accessibility, and click
+  Allow when macOS asks about "System Events". Until then Safari opens its
+  normal window only; the page shows a reminder while Safari is ticked.
+- **Firefox and Zen can't say what a window contains**, so the launcher
+  recognises its window as the one that appeared right after it asked. If
+  Firefox isn't running, it is started first and given time to bring back
+  whatever it wants (a home page, your last session); only then does the
+  launcher add its own window. If it still can't tell which window is its
+  own, it leaves them all alone and says so.
+- **The page remembers which windows are open**, in the browser tab you used.
+  If you reload it while an Open is still running, or use the launcher from a
+  second tab, those windows are simply ones you close yourself.

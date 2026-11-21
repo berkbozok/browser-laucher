@@ -14,12 +14,8 @@ const run = promisify(execFile);
  * - "firefox":  can only list and close windows. Its windows are opened on
  *               the command line and then picked out as "the one window that
  *               wasn't there before".
- * - "menu":     can't be scripted at all (DuckDuckGo). The launcher presses
- *               its New Window / New Fire Window menu items, fills in the
- *               address bar, and later presses the window's close button.
- *               All of that needs the Accessibility permission.
  */
-export type ScriptingKind = "chromium" | "safari" | "firefox" | "menu";
+export type ScriptingKind = "chromium" | "safari" | "firefox";
 
 /** macOS's "the user hasn't allowed this app to control that one". */
 const NOT_ALLOWED = -1743;
@@ -36,17 +32,40 @@ const SCRIPT_TIMEOUT_MS = 60_000;
  */
 const SCRIPT = String.raw`
 ObjC.import("AppKit");
-ObjC.import("CoreGraphics");
 
-// Process id of the running browser, or 0. Asking this needs no permission
-// and, unlike talking to the app, never launches it.
-function pidOf(appPath) {
+// The running browser: its process id and the moment it was started, or pid
+// 0 when it isn't running. Asking needs no permission and, unlike talking to
+// the app, never launches it. Together the two identify one run of the
+// browser, which is what a window id is only meaningful within.
+function runningApp(appPath) {
+  var none = { pid: 0, startedAt: 0 };
   var bundle = $.NSBundle.bundleWithPath(appPath);
-  if (bundle.isNil()) return 0;
-  var running = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
+  if (bundle.isNil()) return none;
+  var copies = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
     bundle.bundleIdentifier
   );
-  return running.count > 0 ? running.objectAtIndex(0).processIdentifier : 0;
+  var best = null;
+  for (var i = 0; i < copies.count; i++) {
+    var copy = copies.objectAtIndex(i);
+    var date = copy.launchDate;
+    var startedAt = date.isNil() ? 0 : Math.round(date.timeIntervalSince1970 * 1000);
+    // A second, short-lived copy exists while a command-line request is
+    // being handed over. The one that has been running longest is the real
+    // browser.
+    var older = !best || (startedAt !== 0 && (best.startedAt === 0 || startedAt < best.startedAt));
+    if (older) best = { pid: copy.processIdentifier, startedAt: startedAt };
+  }
+  return best || none;
+}
+
+function pidOf(appPath) {
+  return runningApp(appPath).pid;
+}
+
+// The reply for a window that is now open and can be found again.
+function opened(appPath, windowId) {
+  var app = runningApp(appPath);
+  return { ok: true, windowId: windowId, pid: app.pid, startedAt: app.startedAt };
 }
 
 function waitUntil(test, seconds) {
@@ -85,7 +104,10 @@ function chromiumBlankWindow(app) {
 function makeChromiumWindow(app, properties) {
   var before = app.windows.id();
   try {
-    return app.Window(properties).make().id();
+    var made = app.Window(properties).make().id();
+    if (before.indexOf(made) === -1) return made;
+    // Not a new window, so not one to claim. Fall through to looking for it.
+    throw new Error("The browser didn't say which window it made.");
   } catch (error) {
     // Opera makes the window and then reports a failure anyway, so look for
     // the window that wasn't there a moment ago.
@@ -106,15 +128,21 @@ function openChromium(request) {
   }
   if (id === null) {
     id = makeChromiumWindow(app, request.private ? { mode: "incognito" } : {});
-    // Never report a private window that isn't one.
+    // Never report a private window that isn't one. A browser that has
+    // private browsing switched off hands back a normal window instead.
     if (request.private && app.windows.byId(id).mode() !== "incognito") {
       app.windows.byId(id).close();
-      return { ok: false, code: null, message: "The browser ignored the request for a private window." };
+      return {
+        ok: false,
+        code: null,
+        privateUnavailable: true,
+        message: "The browser opened a normal window when asked for a private one.",
+      };
     }
   }
   app.windows.byId(id).activeTab.url = request.url;
   app.activate();
-  return { ok: true, windowId: id, pid: pidOf(request.appPath) };
+  return opened(request.appPath, id);
 }
 
 function safariBlankWindow(app) {
@@ -127,22 +155,18 @@ function safariBlankWindow(app) {
   return windows[0].id();
 }
 
-function uiProcess(pid) {
-  return Application("System Events").processes.whose({ unixId: pid })[0];
-}
-
-// Presses the File-menu item that has the given keyboard shortcut. Items are
-// found by shortcut rather than by title, which changes with the system
-// language. Pressing a menu item in another app is what needs the
-// Accessibility permission.
-function pressFileMenuItem(pid, key, shifted) {
-  var process = uiProcess(pid);
+// Presses File > New Private Window in Safari, which has no command for it.
+// The item is found by its shortcut (Shift-Command-N) rather than its title,
+// which changes with the system language. Pressing a menu item in another
+// app is what needs the Accessibility permission.
+function pressNewPrivateWindow(pid) {
+  var process = Application("System Events").processes.whose({ unixId: pid })[0];
   var items = process.menuBars[0].menuBarItems[2].menus[0].menuItems;
   var keys = items.attributes.byName("AXMenuItemCmdChar").value();
   var modifiers = items.attributes.byName("AXMenuItemCmdModifiers").value();
   for (var i = 0; i < keys.length; i++) {
-    // Modifiers value 0 is Command alone, 1 is Shift with Command.
-    if (String(keys[i]).toUpperCase() === key && modifiers[i] === (shifted ? 1 : 0)) {
+    // Modifiers value 1 is Shift together with Command.
+    if (String(keys[i]).toUpperCase() === "N" && modifiers[i] === 1) {
       process.frontmost = true;
       items[i].click();
       return true;
@@ -151,31 +175,21 @@ function pressFileMenuItem(pid, key, shifted) {
   return false;
 }
 
-// File > New Window (Command-N) or, when "shifted", the private variant that
-// browsers keep on Shift-Command-N: Safari's New Private Window, DuckDuckGo's
-// New Fire Window.
-function pressNewWindowItem(pid, shifted) {
-  return pressFileMenuItem(pid, "N", shifted);
-}
-
-// Runs a step that drives another app's interface and turns a refusal into
-// a reply saying which permission is missing.
-function pressing(step, notFoundMessage) {
-  try {
-    if (!step()) return { ok: false, code: null, message: notFoundMessage };
-  } catch (error) {
-    if (error.errorNumber === -1743) throw error;
-    return { ok: false, code: null, needsAccessibility: true, message: String(error.message || error) };
-  }
-  return null;
-}
-
 function openSafariPrivate(app, request) {
   var before = app.windows.id();
-  var problem = pressing(function () {
-    return pressNewWindowItem(pidOf(request.appPath), true);
-  }, "Safari's New Private Window menu item wasn't found.");
-  if (problem) return problem;
+  try {
+    if (!pressNewPrivateWindow(pidOf(request.appPath))) {
+      return { ok: false, code: null, message: "Safari's New Private Window menu item wasn't found." };
+    }
+  } catch (error) {
+    if (error.errorNumber === -1743) throw error;
+    var message = String(error.message || error);
+    // macOS words a missing Accessibility permission as "not allowed
+    // assistive access". Anything else is the menu not being in the state we
+    // expected, which is worth reporting as what it is.
+    var refused = error.errorNumber === -25211 || /assistive access/i.test(message);
+    return { ok: false, code: null, needsAccessibility: refused, message: message };
+  }
   var fresh = waitUntil(function () {
     var ids = app.windows.id().filter(function (id) { return before.indexOf(id) === -1; });
     return ids.length === 1 ? ids : null;
@@ -184,26 +198,37 @@ function openSafariPrivate(app, request) {
     return { ok: false, code: null, message: "Safari didn't open a private window." };
   }
   app.windows.byId(fresh[0]).currentTab.url = request.url;
-  return { ok: true, windowId: fresh[0], pid: pidOf(request.appPath) };
+  return opened(request.appPath, fresh[0]);
 }
 
 function openSafari(request) {
   var app = Application(request.appPath);
-  var id = null;
   var wasClosed = pidOf(request.appPath) === 0;
   if (wasClosed) coldStart(app);
   if (request.private) return openSafariPrivate(app, request);
 
-  if (wasClosed) {
-    id = safariBlankWindow(app);
-    if (id !== null) app.windows.byId(id).currentTab.url = request.url;
-  }
-  if (id === null) {
+  var id = wasClosed ? safariBlankWindow(app) : null;
+  if (id !== null) {
+    app.windows.byId(id).currentTab.url = request.url;
+  } else {
+    // The new document's window is found as the one that wasn't there
+    // before. Taking "the front window" instead would be wrong whenever
+    // another window comes forward at the same moment, and Close would then
+    // shut a window the launcher never opened.
+    var before = app.windows.id();
     app.Document({ url: request.url }).make();
-    id = app.windows[0].id();
+    var fresh = waitUntil(function () {
+      var ids = app.windows.id().filter(function (w) { return before.indexOf(w) === -1; });
+      return ids.length === 1 ? ids : null;
+    }, 6);
+    if (!fresh) {
+      app.activate();
+      return { ok: true, unidentified: "Safari opened the page, but its new window couldn't be picked out." };
+    }
+    id = fresh[0];
   }
   app.activate();
-  return { ok: true, windowId: id, pid: pidOf(request.appPath) };
+  return opened(request.appPath, id);
 }
 
 // Ids of the real browser windows, ignoring panels and tooltips. Each property
@@ -222,14 +247,42 @@ function browserWindowIds(app) {
   throw new Error("The browser's windows kept changing.");
 }
 
+function windowList(appPath, ids) {
+  var app = runningApp(appPath);
+  return { ok: true, pid: app.pid, startedAt: app.startedAt, ids: ids };
+}
+
 function listWindows(request) {
-  var pid = pidOf(request.appPath);
-  var ids = pid === 0 ? [] : browserWindowIds(Application(request.appPath));
-  return { ok: true, pid: pid, ids: ids };
+  var running = pidOf(request.appPath) !== 0;
+  return windowList(request.appPath, running ? browserWindowIds(Application(request.appPath)) : []);
+}
+
+// For a browser that has just been started: waits until its windows have
+// stopped appearing. Whatever it brings back by itself (a home page, the
+// last session) is then known before we add a window of our own.
+function awaitSettledWindows(request) {
+  var app = Application(request.appPath);
+  var deadline = Date.now() + request.seconds * 1000;
+  var last = null;
+  var since = 0;
+  for (;;) {
+    var now = null;
+    try {
+      if (pidOf(request.appPath) !== 0) now = browserWindowIds(app).slice().sort().join(",");
+    } catch (error) {}
+    if (now) {
+      if (now !== last) { last = now; since = Date.now(); }
+      else if (Date.now() - since >= 2500) return windowList(request.appPath, browserWindowIds(app));
+    }
+    if (Date.now() >= deadline) {
+      return { ok: false, code: null, message: "The browser's windows didn't settle after it started." };
+    }
+    delay(0.3);
+  }
 }
 
 // Waits for windows that are not in request.known, then a little longer in
-// case more than one turns up (a browser restoring its last session).
+// case more than one turns up.
 function awaitNewWindows(request) {
   var app = Application(request.appPath);
   var fresh = function () {
@@ -239,231 +292,39 @@ function awaitNewWindows(request) {
     });
     return ids.length > 0 ? ids : null;
   };
-  if (!waitUntil(fresh, request.seconds)) {
-    return { ok: true, pid: pidOf(request.appPath), ids: [] };
-  }
+  if (!waitUntil(fresh, request.seconds)) return windowList(request.appPath, []);
   delay(0.8);
-  return { ok: true, pid: pidOf(request.appPath), ids: fresh() || [] };
+  return windowList(request.appPath, fresh() || []);
 }
 
 function closeWindows(request) {
-  var pid = pidOf(request.appPath);
+  var running = runningApp(request.appPath);
   var closed = 0;
   var alreadyGone = 0;
+  var stuck = 0;
   request.handles.forEach(function (handle) {
-    // After a restart the browser hands out window ids afresh, so an old id
-    // could now belong to a window we never opened.
-    if (pid === 0 || handle.pid !== pid) { alreadyGone++; return; }
+    // Window ids start over when a browser restarts, so a handle from an
+    // earlier run could now point at a window we never opened.
+    var sameRun = running.pid !== 0 && handle.pid === running.pid &&
+      handle.startedAt === running.startedAt;
+    if (!sameRun) { alreadyGone++; return; }
     var win = Application(request.appPath).windows.byId(handle.windowId);
     if (!win.exists()) { alreadyGone++; return; }
     win.close();
-    closed++;
+    // A page can ask "leave this site?" and keep its window open. Safari
+    // goes on listing a closed window for a while, only no longer visible.
+    var went = waitUntil(function () { return !win.exists() || !win.visible(); }, 3);
+    if (went) closed++;
+    else stuck++;
   });
-  return { ok: true, closed: closed, alreadyGone: alreadyGone };
-}
-
-// ---- Browsers with no scripting at all (DuckDuckGo) -------------------------
-// Their windows are known only by the number macOS's window server gives
-// them, which any app can read.
-
-function systemWindows(pid, onScreenOnly) {
-  var info = $.CGWindowListCopyWindowInfo(onScreenOnly ? 1 | 16 : 0, 0);
-  return ObjC.deepUnwrap(ObjC.castRefToObject(info)).filter(function (w) {
-    var size = w.kCGWindowBounds;
-    return w.kCGWindowOwnerPID === pid && w.kCGWindowLayer === 0 &&
-      size.Width > 200 && size.Height > 200;
-  });
-}
-
-function windowNumbers(pid) {
-  return systemWindows(pid, true).map(function (w) { return w.kCGWindowNumber; });
-}
-
-// A browser that was just started and sits on an empty new tab has its
-// address bar focused and empty. That window can take the page.
-function hasBlankStartWindow(pid) {
-  try {
-    if (windowNumbers(pid).length !== 1) return false;
-    var focused = uiProcess(pid).attributes.byName("AXFocusedUIElement").value();
-    return focused.role() === "AXTextField" && String(focused.value() || "") === "";
-  } catch (error) {
-    return false;
-  }
-}
-
-// The address bar, if that is where the cursor is and it is empty. An empty
-// bar in the toolbar is what a window that was just made shows; the check
-// keeps us out of text boxes inside web pages and out of other windows'
-// bars, which hold an address.
-function emptyAddressBar(process) {
-  var field = process.attributes.byName("AXFocusedUIElement").value();
-  if (field.role() !== "AXTextField") return null;
-  if (String(field.value() || "") !== "") return null;
-  if (field.attributes.byName("AXParent").value().role() !== "AXToolbar") return null;
-  return field;
-}
-
-// Puts the address into the address bar of the window that was just made
-// and presses Return. Handing the browser the link the usual way doesn't
-// work: DuckDuckGo jumps to a tab that already shows that address instead of
-// loading it again.
-function loadFromAddressBar(pid, url) {
-  var process = uiProcess(pid);
-  process.frontmost = true;
-  var field = waitUntil(function () { return emptyAddressBar(process); }, 3);
-  if (!field) {
-    // File > Open Location (Command-L) puts the cursor there.
-    pressFileMenuItem(pid, "L", false);
-    field = waitUntil(function () { return emptyAddressBar(process); }, 3);
-  }
-  if (!field) return false;
-
-  field.value = url;
-  delay(0.2);
-  for (var attempt = 0; attempt < 3; attempt++) {
-    process.frontmost = true;
-    delay(0.15);
-    // Return goes to whichever app is in front, so check right before
-    // pressing it.
-    if (process.frontmost()) {
-      Application("System Events").keyCode(36);
-      return true;
-    }
-  }
-  return false;
-}
-
-function openByMenu(request) {
-  var pid = pidOf(request.appPath);
-  var justStarted = pid === 0;
-  if (justStarted) {
-    $.NSWorkspace.sharedWorkspace.openURL($.NSURL.fileURLWithPath(request.appPath));
-    pid = waitUntil(function () { return pidOf(request.appPath); }, 10);
-    if (!pid) return { ok: false, code: null, message: "The browser didn't start." };
-    waitUntil(function () { return windowNumbers(pid).length > 0; }, 8);
-    delay(1);
-  }
-
-  var before = windowNumbers(pid);
-  var windowId = null;
-  if (justStarted && !request.private && hasBlankStartWindow(pid)) {
-    windowId = before[0];
-  } else {
-    var problem = pressing(function () {
-      return pressNewWindowItem(pid, request.private);
-    }, "The browser's New Window menu item wasn't found.");
-    if (problem) return problem;
-
-    var fresh = waitUntil(function () {
-      var numbers = windowNumbers(pid).filter(function (n) { return before.indexOf(n) === -1; });
-      return numbers.length === 1 ? numbers : null;
-    }, 6);
-    if (!fresh) return { ok: false, code: null, message: "The browser didn't open a new window." };
-    windowId = fresh[0];
-  }
-
-  var loadProblem = pressing(function () {
-    return loadFromAddressBar(pid, request.url);
-  }, "The browser's address bar couldn't be reached to load the page.");
-  if (loadProblem) {
-    // Don't leave the empty window behind.
-    try { closeSystemWindow(pid, windowId); } catch (error) {}
-    return loadProblem;
-  }
-  return { ok: true, windowId: windowId, pid: pid };
-}
-
-function sameFrame(bounds, position, size) {
-  return Math.round(position[0]) === Math.round(bounds.X) &&
-    Math.round(position[1]) === Math.round(bounds.Y) &&
-    Math.round(size[0]) === Math.round(bounds.Width) &&
-    Math.round(size[1]) === Math.round(bounds.Height);
-}
-
-// Finds, in the app's own interface, the window that the window server
-// knows as "target". Windows carry no number there, so it is matched by
-// position and size. New windows often open exactly on top of each other;
-// those are told apart by depth, since both lists run front to back.
-// Returns -1 when there is no safe answer.
-function interfaceIndexOf(pid, target) {
-  var bounds = target.kCGWindowBounds;
-  var stacked = systemWindows(pid, true).filter(function (w) {
-    var b = w.kCGWindowBounds;
-    return sameFrame(bounds, [b.X, b.Y], [b.Width, b.Height]);
-  });
-  var depth = stacked.map(function (w) { return w.kCGWindowNumber; })
-    .indexOf(target.kCGWindowNumber);
-
-  var windows = uiProcess(pid).windows;
-  var positions = windows.position();
-  var sizes = windows.size();
-  var minimized = windows.attributes.byName("AXMinimized").value();
-  var candidates = [];
-  for (var i = 0; i < positions.length; i++) {
-    if (!minimized[i] && sameFrame(bounds, positions[i], sizes[i])) candidates.push(i);
-  }
-
-  // Both lists must agree on how many windows share this spot; otherwise
-  // one of them holds a window the other can't see, and guessing could
-  // close the wrong one.
-  if (depth === -1 || candidates.length !== stacked.length) return -1;
-  return candidates[depth];
-}
-
-// Presses the close button of the window with this window-server number.
-// Returns "closed", "gone" if it is no longer on screen, or "unsure" if it
-// can't be picked out safely, in which case it is left open.
-function closeSystemWindow(pid, number) {
-  // Only windows that are on screen count: the window server keeps listing
-  // a closed window for a while, off screen.
-  var target = systemWindows(pid, true).filter(function (w) {
-    return w.kCGWindowNumber === number;
-  })[0];
-  if (!target) return "gone";
-
-  var index = interfaceIndexOf(pid, target);
-  if (index === -1) return "unsure";
-  uiProcess(pid).windows[index].buttons.whose({ subrole: "AXCloseButton" })[0].click();
-  // Let the window go before anything looks at the list again.
-  waitUntil(function () {
-    return systemWindows(pid, true).every(function (w) {
-      return w.kCGWindowNumber !== number;
-    });
-  }, 3);
-  return "closed";
-}
-
-// Closes windows known by their window-server number. A window that can't
-// be picked out safely is left open.
-function closeByFrame(request) {
-  var pid = pidOf(request.appPath);
-  var closed = 0;
-  var alreadyGone = 0;
-  var unsure = 0;
-  var failure = null;
-  request.handles.forEach(function (handle) {
-    if (failure) return;
-    if (pid === 0 || handle.pid !== pid) { alreadyGone++; return; }
-    var outcome = null;
-    failure = pressing(function () {
-      outcome = closeSystemWindow(pid, handle.windowId);
-      return true;
-    }, "");
-    if (failure) return;
-    if (outcome === "gone") alreadyGone++;
-    else if (outcome === "unsure") unsure++;
-    else closed++;
-  });
-  if (failure) return failure;
-  return { ok: true, closed: closed, alreadyGone: alreadyGone, unsure: unsure };
+  return { ok: true, closed: closed, alreadyGone: alreadyGone, stuck: stuck };
 }
 
 var ACTIONS = {
-  "open-by-menu": openByMenu,
-  "close-by-frame": closeByFrame,
   "open-chromium": openChromium,
   "open-safari": openSafari,
   "list-windows": listWindows,
+  "await-settled-windows": awaitSettledWindows,
   "await-new-windows": awaitNewWindows,
   "close-windows": closeWindows,
 };
@@ -488,6 +349,8 @@ type Failure = {
   message: string;
   /** The step that failed needs the macOS Accessibility permission. */
   needsAccessibility?: boolean;
+  /** The browser can't open a private window at all right now. */
+  privateUnavailable?: boolean;
 };
 type Reply<T> = ({ ok: true } & T) | Failure;
 
@@ -516,13 +379,18 @@ export type TrackedOpen =
   | { opened: true; handle: WindowHandle }
   /** The window is open, but we couldn't tell which one it is. */
   | { opened: true; handle: null; detail: string }
-  /** Nothing was opened this way; the caller should open the page plainly. */
+  /** Nothing was opened this way. */
   | {
       opened: false;
       /** macOS hasn't allowed the launcher to control this browser. */
       notAllowed: boolean;
       /** The Accessibility permission is what's missing. */
       needsAccessibility: boolean;
+      /**
+       * The browser answered a request for a private window with a normal
+       * one. Don't try another way: it would end the same.
+       */
+      privateUnavailable: boolean;
       detail: string;
     };
 
@@ -531,51 +399,78 @@ function refused(failure: Failure): TrackedOpen {
     opened: false,
     notAllowed: failure.code === NOT_ALLOWED,
     needsAccessibility: failure.needsAccessibility === true,
+    privateUnavailable: failure.privateUnavailable === true,
     detail: failure.message,
   };
 }
 
 /**
  * For browsers that are told what to do on their command line (Firefox).
- * `newWindow` must make exactly one new window appear. `load`, when given,
- * then puts the page into that window.
+ * `start` launches the browser with nothing to open. `newWindow` must make
+ * exactly one new window appear. `load`, when given, then puts the page into
+ * that window.
  */
 export type CommandLineSteps = {
+  start: () => Promise<void>;
   newWindow: () => Promise<void>;
   load?: () => Promise<void>;
 };
+
+type WindowList = { pid: number; startedAt: number; ids: number[] };
 
 async function openByWatchingWindows(
   appPath: string,
   steps: CommandLineSteps,
 ): Promise<TrackedOpen> {
-  const before = await script<{ pid: number; ids: number[] }>({
-    action: "list-windows",
-    appPath,
-  });
+  let before = await script<WindowList>({ action: "list-windows", appPath });
   if (!before.ok) return refused(before);
 
+  let unsettled: string | null = null;
+  if (before.pid === 0) {
+    // Not running. Started with a page to open, it could put that page in
+    // the same window as tabs it restores, and closing "our" window would
+    // then close those too. So start it bare, let it bring back whatever it
+    // wants, and only then add a window that is ours alone.
+    await steps.start();
+    before = await script<WindowList>({
+      action: "await-settled-windows",
+      appPath,
+      seconds: 25,
+    });
+    if (!before.ok) unsettled = before.message;
+  }
+
   await steps.newWindow();
-  const after = await script<{ pid: number; ids: number[] }>({
-    action: "await-new-windows",
-    appPath,
-    known: before.ids,
-    seconds: 12,
-  });
+  const after = before.ok
+    ? await script<WindowList>({
+        action: "await-new-windows",
+        appPath,
+        known: before.ids,
+        seconds: 12,
+      })
+    : null;
   await steps.load?.();
 
-  // Exactly one new window is ours. None, or several at once (a browser
-  // bringing back its last session), and we can't say which one is, so we
-  // don't claim any.
-  if (after.ok && after.ids.length === 1) {
-    return { opened: true, handle: { windowId: after.ids[0], pid: after.pid } };
+  // Exactly one new window is ours. None, or several at once, and we can't
+  // say which one is, so we don't claim any.
+  if (after?.ok && after.ids.length === 1) {
+    return {
+      opened: true,
+      handle: {
+        windowId: after.ids[0],
+        pid: after.pid,
+        startedAt: after.startedAt,
+      },
+    };
   }
   return {
     opened: true,
     handle: null,
-    detail: after.ok
-      ? `Expected one new window, found ${after.ids.length}.`
-      : after.message,
+    detail:
+      unsettled ??
+      (after?.ok
+        ? `Expected one new window, found ${after.ids.length}.`
+        : (after?.message ?? "The browser's windows couldn't be listed.")),
   };
 }
 
@@ -597,22 +492,26 @@ export async function openTrackedWindow(options: {
     return openByWatchingWindows(appPath, options.commandLine);
   }
 
-  const action =
-    kind === "safari"
-      ? "open-safari"
-      : kind === "menu"
-        ? "open-by-menu"
-        : "open-chromium";
-  const reply = await script<WindowHandle>({
-    action,
+  const reply = await script<
+    WindowHandle | { windowId?: undefined; unidentified: string }
+  >({
+    action: kind === "safari" ? "open-safari" : "open-chromium",
     appPath,
     url,
     private: options.private,
   });
   if (!reply.ok) return refused(reply);
+  if (reply.windowId === undefined) {
+    // The page is open, but the script couldn't say in which window.
+    return { opened: true, handle: null, detail: reply.unidentified };
+  }
   return {
     opened: true,
-    handle: { windowId: reply.windowId, pid: reply.pid },
+    handle: {
+      windowId: reply.windowId,
+      pid: reply.pid,
+      startedAt: reply.startedAt,
+    },
   };
 }
 
@@ -621,28 +520,22 @@ export type CloseOutcome =
       ok: true;
       closed: number;
       alreadyGone: number;
-      /** Windows left open because they couldn't be told apart from others. */
-      unsure: number;
+      /** Windows that were asked to close but stayed open. */
+      stuck: number;
     }
-  | {
-      ok: false;
-      notAllowed: boolean;
-      needsAccessibility: boolean;
-      detail: string;
-    };
+  | { ok: false; notAllowed: boolean; detail: string };
 
 /** Closes the windows behind `handles`, skipping any that no longer exist. */
 export async function closeTrackedWindows(
-  kind: ScriptingKind,
   appPath: string,
   handles: readonly WindowHandle[],
 ): Promise<CloseOutcome> {
   const reply = await script<{
     closed: number;
     alreadyGone: number;
-    unsure?: number;
+    stuck: number;
   }>({
-    action: kind === "menu" ? "close-by-frame" : "close-windows",
+    action: "close-windows",
     appPath,
     handles,
   });
@@ -650,7 +543,6 @@ export async function closeTrackedWindows(
     return {
       ok: false,
       notAllowed: reply.code === NOT_ALLOWED,
-      needsAccessibility: reply.needsAccessibility === true,
       detail: reply.message,
     };
   }
@@ -658,6 +550,6 @@ export async function closeTrackedWindows(
     ok: true,
     closed: reply.closed,
     alreadyGone: reply.alreadyGone,
-    unsure: reply.unsure ?? 0,
+    stuck: reply.stuck,
   };
 }

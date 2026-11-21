@@ -20,6 +20,13 @@ const STORAGE_KEY = "browser-launcher:v1";
 /** Windows the launcher opened and can still close, per browser id. */
 type TrackedWindows = Record<string, WindowHandle[]>;
 
+/**
+ * The most windows remembered per browser, which is also the most the server
+ * closes in one go. Beyond it the oldest are dropped; by then they are
+ * windows that were closed by hand long ago.
+ */
+const MAX_TRACKED_PER_BROWSER = 200;
+
 type Prefs = {
   url: string;
   selected: string[];
@@ -37,10 +44,11 @@ type Notice = { text: string; allGood: boolean };
 
 function isHandle(value: unknown): value is WindowHandle {
   if (typeof value !== "object" || value === null) return false;
-  const { windowId, pid } = value as Record<string, unknown>;
+  const { windowId, pid, startedAt } = value as Record<string, unknown>;
   return (
     (typeof windowId === "string" || typeof windowId === "number") &&
-    typeof pid === "number"
+    typeof pid === "number" &&
+    typeof startedAt === "number"
   );
 }
 
@@ -50,7 +58,7 @@ function readTrackedWindows(value: unknown): TrackedWindows {
   for (const [id, handles] of Object.entries(value)) {
     if (!Array.isArray(handles)) continue;
     const valid = handles.filter(isHandle);
-    if (valid.length > 0) windows[id] = valid;
+    if (valid.length > 0) windows[id] = valid.slice(-MAX_TRACKED_PER_BROWSER);
   }
   return windows;
 }
@@ -181,12 +189,6 @@ function summarizeOpen(results: OpenResult[]): Notice | null {
   if (notAllowed.length > 0) {
     parts.push(
       `macOS hasn't allowed the launcher to control ${nameList.format(notAllowed)}, so Close can't reach ${notAllowed.length === 1 ? "it" : "them"}. Allow it under System Settings → Privacy & Security → Automation.`,
-    );
-  }
-  const needAccess = namesWhere((r) => r.untracked === "needs-accessibility");
-  if (needAccess.length > 0) {
-    parts.push(
-      `Close can't reach ${nameList.format(needAccess)} until Accessibility is switched on for the launcher (System Settings → Privacy & Security → Accessibility).`,
     );
   }
   const byHand = namesWhere(
@@ -368,7 +370,9 @@ export function Launcher() {
         for (const result of results) {
           const handles = handlesOf(result);
           if (handles.length > 0) {
-            next[result.id] = [...(next[result.id] ?? []), ...handles];
+            next[result.id] = [...(next[result.id] ?? []), ...handles].slice(
+              -MAX_TRACKED_PER_BROWSER,
+            );
           }
         }
         return next;
@@ -698,7 +702,13 @@ function BrowserCard({
         onChange={onToggle}
       />
       <BrowserIcon browser={browser} />
-      <span className="flex min-w-0 flex-1 flex-col">
+      <span
+        className="flex min-w-0 flex-1 flex-col"
+        // The technical reason, when a window opened but can't be closed.
+        title={
+          state?.status === "done" ? state.result.untrackedDetail : undefined
+        }
+      >
         <span className="truncate text-sm font-medium">{browser.name}</span>
         <LaunchStatus
           state={state}

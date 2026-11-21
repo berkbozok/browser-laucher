@@ -5,6 +5,12 @@ const LOCAL_HOST =
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 /**
+ * "mailto:someone", "tel:…" and the like: a scheme with no "//". A colon
+ * followed by a digit is a port instead ("localhost:3000").
+ */
+const OTHER_SCHEME = /^[a-z][a-z0-9+.-]*:(?!\d)/i;
+
+/**
  * Turns what a person types ("example.com", "localhost:3000") into a full
  * http(s) URL. Returns null for anything that isn't a web address, so other
  * schemes (file:, javascript:, custom app links) never reach a browser.
@@ -12,6 +18,8 @@ const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 export function normalizeUrl(input: string): string | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
+
+  if (!HAS_SCHEME.test(trimmed) && OTHER_SCHEME.test(trimmed)) return null;
 
   const candidate = HAS_SCHEME.test(trimmed)
     ? trimmed

@@ -50,9 +50,10 @@ type BrowserDefinition = {
  * Every browser the launcher knows about. To support another one, add it here.
  *
  * Opening, private windows and closing were checked on Chrome, Brave,
- * Firefox, Safari, Opera, Edge, Vivaldi, Zen and DuckDuckGo. The remaining
- * entries that have a private switch are built on the same engines and use
- * the same one.
+ * Firefox, Safari, Opera, Edge, Vivaldi and Zen. The remaining entries that
+ * have a private switch are built on the same engines and use the same one.
+ * Entries without `scripting` (DuckDuckGo, Orion, Arc, Tor) just get the page
+ * handed to them: a normal window only, closed by hand.
  */
 const CATALOG: readonly BrowserDefinition[] = [
   {
@@ -120,12 +121,7 @@ const CATALOG: readonly BrowserDefinition[] = [
     privateFlag: "--incognito",
     scripting: "chromium",
   },
-  {
-    id: "duckduckgo",
-    name: "DuckDuckGo",
-    macApps: ["DuckDuckGo.app"],
-    scripting: "menu",
-  },
+  { id: "duckduckgo", name: "DuckDuckGo", macApps: ["DuckDuckGo.app"] },
   {
     id: "zen",
     name: "Zen",
@@ -179,10 +175,6 @@ type InstalledBrowser = DetectedBrowser & { appPath: string };
 /** Detection and launching are macOS-only for now. */
 export const isSupportedPlatform = process.platform === "darwin";
 
-function pressesMenu(definition: BrowserDefinition): boolean {
-  return definition.scripting === "safari" || definition.scripting === "menu";
-}
-
 async function exists(target: string): Promise<boolean> {
   try {
     await access(target);
@@ -212,11 +204,11 @@ export async function detectBrowsers(): Promise<DetectedBrowser[]> {
       name: definition.name,
       appPath: isSupportedPlatform ? await findApp(definition.macApps) : null,
       privateFlag: definition.privateFlag ?? null,
-      // Safari and DuckDuckGo have no switch, but their menu can be pressed
-      // (see window-control).
+      // Safari has no switch, but its menu can be pressed (see window-control).
       supportsPrivate:
-        definition.privateFlag !== undefined || pressesMenu(definition),
-      privateViaMenu: pressesMenu(definition),
+        definition.privateFlag !== undefined ||
+        definition.scripting === "safari",
+      privateViaMenu: definition.scripting === "safari",
       linksFollowLastWindow: definition.linksFollowLastWindow ?? false,
       scripting: definition.scripting ?? null,
     })),
@@ -272,10 +264,15 @@ function firefoxSteps(
   url: string,
   privateFlag: string | null,
 ): CommandLineSteps {
+  const start = () => runOpen(["-a", appPath]);
   if (!privateFlag) {
-    return { newWindow: () => openWithArgs(appPath, ["--new-window", url]) };
+    return {
+      start,
+      newWindow: () => openWithArgs(appPath, ["--new-window", url]),
+    };
   }
   return {
+    start,
     newWindow: () => openWithArgs(appPath, [privateFlag]),
     load: () => openWithArgs(appPath, [privateFlag, url]),
   };
@@ -288,8 +285,9 @@ type WindowOutcome =
 
 /**
  * Opens one window, normal or private. It is opened in a way the launcher
- * can close again whenever the browser allows that; `track: false` skips
- * straight to the fallback.
+ * can close again whenever the browser allows that. `track: false` means an
+ * earlier step already found macOS in the way, so scripting isn't tried
+ * again (each try can sit on an unanswered permission prompt for a minute).
  */
 async function openWindow(
   browser: InstalledBrowser,
@@ -297,14 +295,17 @@ async function openWindow(
   { isPrivate, track }: { isPrivate: boolean; track: boolean },
 ): Promise<WindowOutcome> {
   const privateFlag = isPrivate ? browser.privateFlag : null;
-  // A private window with no switch to fall back on (Safari, DuckDuckGo) can
-  // only be made through scripting.
+  // A private window with no switch to fall back on (Safari) can only be
+  // made through scripting.
   const scriptingOnly = isPrivate && privateFlag === null;
+  if (scriptingOnly && !track) {
+    return { ok: false, error: menuPermissionMessage(browser.name) };
+  }
 
   let untracked: Untracked = "unsupported";
   let detail: string | undefined;
   try {
-    if (browser.scripting && (track || scriptingOnly)) {
+    if (browser.scripting && track) {
       const tracked = await openTrackedWindow({
         kind: browser.scripting,
         appPath: browser.appPath,
@@ -317,6 +318,14 @@ async function openWindow(
           ? { ok: true, handle: tracked.handle }
           : { ok: true, untracked: "unidentified", detail: tracked.detail };
       }
+      if (tracked.privateUnavailable) {
+        // The switch would get a normal window too, and we'd report it as
+        // private.
+        return {
+          ok: false,
+          error: `${browser.name} opened a normal window when asked for a private one, so it was closed again. Private browsing may be switched off in ${browser.name}.`,
+        };
+      }
       if (scriptingOnly) {
         return {
           ok: false,
@@ -326,11 +335,7 @@ async function openWindow(
               : tracked.detail,
         };
       }
-      untracked = tracked.needsAccessibility
-        ? "needs-accessibility"
-        : tracked.notAllowed
-          ? "not-allowed"
-          : "unidentified";
+      untracked = tracked.notAllowed ? "not-allowed" : "unidentified";
       detail = tracked.detail;
     } else if (browser.scripting) {
       untracked = "not-allowed";
@@ -390,9 +395,7 @@ export async function openInBrowsers(
         const extra = await openWindow(browser, url, {
           isPrivate: true,
           // Don't sit through a second unanswered permission prompt.
-          track:
-            result.untracked !== "not-allowed" &&
-            result.untracked !== "needs-accessibility",
+          track: result.untracked !== "not-allowed",
         });
         noteUntracked(extra);
         result.privateWindow = extra.ok
@@ -403,26 +406,7 @@ export async function openInBrowsers(
     return result;
   };
 
-  // Browsers driven through their menus get a Return key press, and a key
-  // press lands in whichever app is in front. So they go last, one at a
-  // time, once nothing else is still bringing windows forward.
-  const unique = [...new Set(ids)];
-  const pressesKeys = (id: string) => detected.get(id)?.scripting === "menu";
-  const results = new Map<string, OpenResult>();
-
-  const others = unique.filter((id) => !pressesKeys(id));
-  await Promise.all(
-    others.map(async (id) => results.set(id, await openOne(id))),
-  );
-  const keyDriven = unique.filter(pressesKeys);
-  if (keyDriven.length > 0 && others.length > 0) {
-    await new Promise((resolve) => setTimeout(resolve, 700));
-  }
-  for (const id of keyDriven) {
-    results.set(id, await openOne(id));
-  }
-
-  return unique.flatMap((id) => results.get(id) ?? []);
+  return Promise.all([...new Set(ids)].map(openOne));
 }
 
 /**
@@ -431,7 +415,7 @@ export async function openInBrowsers(
  * prompt for either one looks the same from here.
  */
 function menuPermissionMessage(name: string): string {
-  return `${name} can only be driven by pressing its menus and buttons, and macOS has to allow that. Click Allow if it asks about “System Events”, and turn on the app running the launcher (Terminal, Cursor, …) under System Settings → Privacy & Security → Accessibility. Then try again.`;
+  return `${name} only opens a private window when the launcher presses its menu, and macOS has to allow that. Click Allow if it asks about “System Events”, and turn on the app running the launcher (Terminal, Cursor, …) under System Settings → Privacy & Security → Accessibility. Then try again.`;
 }
 
 /** What to tell someone when macOS is what stands between us and a browser. */
@@ -458,19 +442,11 @@ export async function closeInBrowsers(
         return { ...nothing, error: "This browser's windows can't be closed from here." };
       }
 
-      const outcome = await closeTrackedWindows(
-        browser.scripting,
-        browser.appPath,
-        handles,
-      );
+      const outcome = await closeTrackedWindows(browser.appPath, handles);
       if (!outcome.ok) {
         return {
           ...nothing,
-          error: outcome.needsAccessibility
-            ? menuPermissionMessage(name)
-            : outcome.notAllowed
-              ? notAllowedMessage(name)
-              : outcome.detail,
+          error: outcome.notAllowed ? notAllowedMessage(name) : outcome.detail,
         };
       }
       const counts = {
@@ -479,10 +455,11 @@ export async function closeInBrowsers(
         closed: outcome.closed,
         alreadyGone: outcome.alreadyGone,
       };
-      if (outcome.unsure === 0) return counts;
+      if (outcome.stuck === 0) return counts;
+      const those = outcome.stuck === 1 ? "One window" : `${outcome.stuck} windows`;
       return {
         ...counts,
-        error: `${outcome.unsure === 1 ? "One window" : `${outcome.unsure} windows`} couldn't be picked out safely among the others. Close ${outcome.unsure === 1 ? "it" : "them"} by hand.`,
+        error: `${those} stayed open; the page may be asking before it lets go. Close ${outcome.stuck === 1 ? "it" : "them"} by hand, or press Close again.`,
       };
     }),
   );
