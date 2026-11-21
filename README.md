@@ -1,36 +1,41 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Browser Launcher
 
-## Getting Started
+Open one URL in every browser you pick, all at once. Built with Next.js,
+TypeScript, Node.js and Tailwind CSS.
 
-First, run the development server:
+## Run it
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open <http://127.0.0.1:3000>. Type a URL, tick the browsers, press
+**Open**. Your last URL and selection are remembered.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## How it works
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+A web page can't start other apps, so the page asks the Node.js server to do it.
 
-## Learn More
+| File | What it does |
+| --- | --- |
+| `lib/browsers.ts` | The list of known browsers, finding which are installed, opening a URL in them, and reading their icons. |
+| `lib/url.ts` | Turns typed text (`example.com`, `localhost:3000`) into a full `http(s)` URL and rejects anything else. |
+| `lib/local-request.ts` | Refuses API calls that don't come from the launcher's own page. |
+| `app/api/browsers` | `GET` the browsers and whether each is installed. `…/[id]/icon` serves the app's icon. |
+| `app/api/open` | `POST { url, browsers }` to open the URL. Returns a result per browser. |
+| `components/launcher.tsx` | The page: URL field, browser cards, results. |
 
-To learn more about Next.js, take a look at the following resources:
+## Add a browser
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Add one line to `CATALOG` in `lib/browsers.ts` with the app's name as it
+appears in `/Applications`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Limits
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **macOS only for now.** Browsers are found in `/Applications` and
+  `~/Applications` and opened with the system `open` command.
+- **Local only.** The server listens on `127.0.0.1`, and the API rejects
+  requests from other sites or other hostnames, because it launches apps on
+  the machine it runs on.
+- Only `http://` and `https://` addresses are opened.
