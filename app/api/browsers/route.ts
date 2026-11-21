@@ -9,10 +9,11 @@ export async function GET(request: Request) {
   const detected = await detectBrowsers();
   const body: BrowsersResponse = {
     supported: isSupportedPlatform,
-    browsers: detected.map(({ id, name, appPath }) => ({
+    browsers: detected.map(({ id, name, appPath, privateFlag }) => ({
       id,
       name,
       installed: appPath !== null,
+      supportsPrivate: privateFlag !== null,
     })),
   };
   return Response.json(body);

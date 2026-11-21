@@ -5,18 +5,66 @@ import { useEffect, useRef, useState } from "react";
 import type {
   BrowserInfo,
   BrowsersResponse,
+  CloseRequest,
+  CloseResponse,
+  CloseResult,
+  OpenRequest,
   OpenResponse,
+  OpenResult,
+  WindowHandle,
 } from "@/lib/types";
 import { normalizeUrl } from "@/lib/url";
 
 const STORAGE_KEY = "browser-launcher:v1";
 
-type Prefs = { url: string; selected: string[] };
+/** Windows the launcher opened and can still close, per browser id. */
+type TrackedWindows = Record<string, WindowHandle[]>;
+
+type Prefs = {
+  url: string;
+  selected: string[];
+  incognito: boolean;
+  windows: TrackedWindows;
+};
 
 type LaunchState =
   | { status: "opening" }
-  | { status: "opened" }
-  | { status: "failed"; error: string };
+  | { status: "done"; result: OpenResult }
+  | { status: "closing" }
+  | { status: "closed"; result: CloseResult };
+
+type Notice = { text: string; allGood: boolean };
+
+function isHandle(value: unknown): value is WindowHandle {
+  if (typeof value !== "object" || value === null) return false;
+  const { windowId, pid } = value as Record<string, unknown>;
+  return (
+    (typeof windowId === "string" || typeof windowId === "number") &&
+    typeof pid === "number"
+  );
+}
+
+function readTrackedWindows(value: unknown): TrackedWindows {
+  if (typeof value !== "object" || value === null) return {};
+  const windows: TrackedWindows = {};
+  for (const [id, handles] of Object.entries(value)) {
+    if (!Array.isArray(handles)) continue;
+    const valid = handles.filter(isHandle);
+    if (valid.length > 0) windows[id] = valid;
+  }
+  return windows;
+}
+
+/** The handles of the windows one browser just opened, if it gave any. */
+function handlesOf(result: OpenResult): WindowHandle[] {
+  const extra =
+    result.privateWindow?.status === "opened"
+      ? result.privateWindow.handle
+      : undefined;
+  return [result.handle, extra].filter(
+    (handle): handle is WindowHandle => handle !== undefined,
+  );
+}
 
 function readPrefs(): Prefs | null {
   try {
@@ -24,12 +72,17 @@ function readPrefs(): Prefs | null {
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
-    const { url, selected } = parsed as Record<string, unknown>;
+    const { url, selected, incognito, windows } = parsed as Record<
+      string,
+      unknown
+    >;
     return {
       url: typeof url === "string" ? url : "",
       selected: Array.isArray(selected)
         ? selected.filter((id): id is string => typeof id === "string")
         : [],
+      incognito: incognito === true,
+      windows: readTrackedWindows(windows),
     };
   } catch {
     return null;
@@ -70,8 +123,92 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function plural(count: number): string {
-  return `${count} ${count === 1 ? "browser" : "browsers"}`;
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+const nameList = new Intl.ListFormat("en", { type: "conjunction" });
+
+/** One line describing how the last launch went, across all browsers. */
+function summarizeOpen(results: OpenResult[]): Notice | null {
+  if (results.length === 0) return null;
+
+  const privateWindows = results.flatMap((r) => r.privateWindow ?? []);
+  const opened =
+    results.filter((r) => r.ok).length +
+    privateWindows.filter((p) => p.status === "opened").length;
+  const failed =
+    results.filter((r) => !r.ok).length +
+    privateWindows.filter((p) => p.status === "failed").length;
+  const namesWhere = (test: (result: OpenResult) => boolean) =>
+    results.filter(test).map((r) => r.name);
+
+  const parts: string[] = [];
+  if (privateWindows.length === 0) {
+    parts.push(
+      failed === 0
+        ? `Opened in ${plural(opened, "browser")}.`
+        : `Opened in ${opened} of ${plural(results.length, "browser")}. ${failed} failed.`,
+    );
+  } else {
+    parts.push(
+      failed === 0
+        ? `Opened ${plural(opened, "window")} in ${plural(results.length, "browser")}.`
+        : `Opened ${opened} of ${plural(opened + failed, "window")}. ${failed} failed.`,
+    );
+    const normalOnly = namesWhere(
+      (r) => r.privateWindow?.status === "unsupported",
+    );
+    if (normalOnly.length > 0) {
+      parts.push(
+        `${nameList.format(normalOnly)} can only open a normal window from here.`,
+      );
+    }
+  }
+
+  // Windows that opened but that the Close button won't be able to reach.
+  const notAllowed = namesWhere((r) => r.untracked === "not-allowed");
+  if (notAllowed.length > 0) {
+    parts.push(
+      `macOS hasn't allowed the launcher to control ${nameList.format(notAllowed)}, so Close can't reach ${notAllowed.length === 1 ? "it" : "them"}. Allow it under System Settings → Privacy & Security → Automation.`,
+    );
+  }
+  const byHand = namesWhere(
+    (r) => r.untracked === "unsupported" || r.untracked === "unidentified",
+  );
+  if (byHand.length > 0) {
+    parts.push(
+      `Windows in ${nameList.format(byHand)} have to be closed by hand.`,
+    );
+  }
+
+  return {
+    text: parts.join(" "),
+    allGood: failed === 0 && notAllowed.length === 0,
+  };
+}
+
+function summarizeClose(results: CloseResult[]): Notice {
+  const closed = results.reduce((sum, r) => sum + r.closed, 0);
+  const gone = results.reduce((sum, r) => sum + r.alreadyGone, 0);
+  const failures = results.filter((r) => r.error);
+
+  const parts: string[] = [];
+  if (closed > 0) parts.push(`Closed ${plural(closed, "window")}.`);
+  if (gone > 0) {
+    parts.push(
+      closed > 0
+        ? `${gone} had already been closed.`
+        : gone === 1
+          ? "That window had already been closed."
+          : "Those windows had already been closed.",
+    );
+  }
+  for (const failure of failures) {
+    parts.push(`${failure.name}: ${failure.error}`);
+  }
+  if (parts.length === 0) parts.push("There was nothing to close.");
+  return { text: parts.join(" "), allGood: failures.length === 0 };
 }
 
 export function Launcher() {
@@ -82,9 +219,13 @@ export function Launcher() {
 
   const [url, setUrl] = useState("");
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [incognito, setIncognito] = useState(false);
   const [launch, setLaunch] = useState<Record<string, LaunchState>>({});
+  const [tracked, setTracked] = useState<TrackedWindows>({});
   const [formError, setFormError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [opening, setOpening] = useState(false);
+  const [closing, setClosing] = useState(false);
 
   // Saved choices are applied once, on the first successful scan.
   const restored = useRef(false);
@@ -120,6 +261,8 @@ export function Launcher() {
           ),
         );
         if (prefs?.url) setUrl((current) => current || prefs.url);
+        if (prefs?.incognito) setIncognito(true);
+        if (prefs) setTracked(prefs.windows);
       })
       .catch((error: unknown) => {
         if (!cancelled) setScanError(toMessage(error));
@@ -135,12 +278,22 @@ export function Launcher() {
 
   useEffect(() => {
     if (!data) return;
-    writePrefs({ url, selected: [...selected] });
-  }, [data, url, selected]);
+    writePrefs({ url, selected: [...selected], incognito, windows: tracked });
+  }, [data, url, selected, incognito, tracked]);
 
   const installed = data?.browsers.filter((browser) => browser.installed) ?? [];
   const missing = data?.browsers.filter((browser) => !browser.installed) ?? [];
   const chosen = installed.filter((browser) => selected.has(browser.id));
+  // Browsers without a private mode still get their normal window.
+  const windowCount =
+    chosen.length +
+    (incognito ? chosen.filter((browser) => browser.supportsPrivate).length : 0);
+  // Close only ever touches the browsers that are ticked right now.
+  const closable = chosen.flatMap((browser) => {
+    const handles = tracked[browser.id] ?? [];
+    return handles.length > 0 ? [{ browser: browser.id, handles }] : [];
+  });
+  const closableCount = closable.reduce((sum, c) => sum + c.handles.length, 0);
 
   function rescan() {
     setScanning(true);
@@ -166,29 +319,42 @@ export function Launcher() {
 
     const ids = chosen.map((browser) => browser.id);
     setFormError(null);
+    setNotice(null);
     setUrl(target);
     setOpening(true);
     setLaunch(Object.fromEntries(ids.map((id) => [id, { status: "opening" }])));
 
+    const request: OpenRequest = {
+      url: target,
+      browsers: ids,
+      includePrivate: incognito,
+    };
     try {
       const { results } = await requestJson<OpenResponse>("/api/open", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: target, browsers: ids }),
+        body: JSON.stringify(request),
       });
       setLaunch(
         Object.fromEntries(
           results.map((result): [string, LaunchState] => [
             result.id,
-            result.ok
-              ? { status: "opened" }
-              : {
-                  status: "failed",
-                  error: result.error ?? "Could not open this browser.",
-                },
+            { status: "done", result },
           ]),
         ),
       );
+      // Remember the new windows on top of any that are still open.
+      setTracked((current) => {
+        const next = { ...current };
+        for (const result of results) {
+          const handles = handlesOf(result);
+          if (handles.length > 0) {
+            next[result.id] = [...(next[result.id] ?? []), ...handles];
+          }
+        }
+        return next;
+      });
+      setNotice(summarizeOpen(results));
     } catch (error) {
       setLaunch({});
       setFormError(toMessage(error));
@@ -197,15 +363,61 @@ export function Launcher() {
     }
   }
 
-  const outcomes = Object.values(launch);
-  const openedCount = outcomes.filter((o) => o.status === "opened").length;
-  const failedCount = outcomes.filter((o) => o.status === "failed").length;
-  const summary =
-    opening || outcomes.length === 0
-      ? null
-      : failedCount === 0
-        ? `Opened in ${plural(openedCount)}.`
-        : `Opened in ${openedCount} of ${plural(outcomes.length)}. ${failedCount} failed.`;
+  async function closeAll() {
+    if (closable.length === 0) return;
+    const request: CloseRequest = { windows: closable };
+
+    setFormError(null);
+    setNotice(null);
+    setClosing(true);
+    setLaunch((current) => ({
+      ...current,
+      ...Object.fromEntries(
+        closable.map((c): [string, LaunchState] => [
+          c.browser,
+          { status: "closing" },
+        ]),
+      ),
+    }));
+
+    try {
+      const { results } = await requestJson<CloseResponse>("/api/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      setLaunch((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          results.map((result): [string, LaunchState] => [
+            result.id,
+            { status: "closed", result },
+          ]),
+        ),
+      }));
+      // Forget the windows that are gone. Where closing failed, keep them so
+      // the button can try again.
+      setTracked((current) => {
+        const next = { ...current };
+        for (const result of results) {
+          if (!result.error) delete next[result.id];
+        }
+        return next;
+      });
+      setNotice(summarizeClose(results));
+    } catch (error) {
+      setLaunch((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([, state]) => state.status !== "closing",
+          ),
+        ),
+      );
+      setFormError(toMessage(error));
+    } finally {
+      setClosing(false);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-8">
@@ -236,6 +448,7 @@ export function Launcher() {
             onChange={(event) => {
               setUrl(event.target.value);
               setFormError(null);
+              setNotice(null);
               setLaunch({});
             }}
             aria-invalid={formError ? true : undefined}
@@ -244,28 +457,63 @@ export function Launcher() {
           />
           <button
             type="submit"
-            disabled={opening || chosen.length === 0}
+            disabled={opening || closing || chosen.length === 0}
             className="h-11 shrink-0 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white outline-none transition hover:bg-blue-500 focus-visible:ring-3 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500"
           >
             {opening
               ? "Opening…"
               : chosen.length === 0
                 ? "Select a browser"
-                : `Open in ${plural(chosen.length)}`}
+                : incognito
+                  ? `Open ${plural(windowCount, "window")}`
+                  : `Open in ${plural(chosen.length, "browser")}`}
+          </button>
+          <button
+            type="button"
+            onClick={() => void closeAll()}
+            disabled={opening || closing || closableCount === 0}
+            title="Closes the windows the launcher opened in the ticked browsers"
+            className="h-11 shrink-0 rounded-lg border border-zinc-300 bg-white px-5 text-sm font-medium outline-none transition hover:bg-zinc-100 focus-visible:ring-3 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:text-zinc-400 disabled:hover:bg-white dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800 dark:disabled:text-zinc-600 dark:disabled:hover:bg-zinc-900"
+          >
+            {closing
+              ? "Closing…"
+              : closableCount === 0
+                ? "Close windows"
+                : `Close ${plural(closableCount, "window")}`}
           </button>
         </div>
+        <label className="mt-1 flex w-fit cursor-pointer items-center gap-3 select-none">
+          <input
+            type="checkbox"
+            role="switch"
+            className="peer sr-only"
+            checked={incognito}
+            onChange={(event) => setIncognito(event.target.checked)}
+          />
+          <span
+            aria-hidden="true"
+            className="relative h-6 w-10 shrink-0 rounded-full bg-zinc-300 transition peer-checked:bg-blue-600 peer-focus-visible:ring-3 peer-focus-visible:ring-blue-500/40 after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-4 dark:bg-zinc-700"
+          />
+          <span className="text-sm">
+            <span className="font-medium">Also open in incognito</span>
+            <span className="text-zinc-500 dark:text-zinc-400">
+              {" "}
+              — a second, private window in each browser
+            </span>
+          </span>
+        </label>
         <p id="form-status" aria-live="polite" className="min-h-5 text-sm">
           {formError ? (
             <span className="text-red-600 dark:text-red-400">{formError}</span>
-          ) : summary ? (
+          ) : notice ? (
             <span
               className={
-                failedCount === 0
+                notice.allGood
                   ? "text-emerald-700 dark:text-emerald-400"
                   : "text-amber-700 dark:text-amber-400"
               }
             >
-              {summary}
+              {notice.text}
             </span>
           ) : null}
         </p>
@@ -333,6 +581,8 @@ export function Launcher() {
                   browser={browser}
                   checked={selected.has(browser.id)}
                   state={launch[browser.id]}
+                  normalOnly={incognito && !browser.supportsPrivate}
+                  openCount={tracked[browser.id]?.length ?? 0}
                   onToggle={() => toggle(browser.id)}
                 />
               </li>
@@ -375,11 +625,17 @@ function BrowserCard({
   browser,
   checked,
   state,
+  normalOnly,
+  openCount,
   onToggle,
 }: {
   browser: BrowserInfo;
   checked: boolean;
   state: LaunchState | undefined;
+  /** Incognito is on, but this browser can't open a private window. */
+  normalOnly: boolean;
+  /** How many windows the launcher has open in this browser. */
+  openCount: number;
   onToggle: () => void;
 }) {
   return (
@@ -393,7 +649,11 @@ function BrowserCard({
       <BrowserIcon browser={browser} />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-sm font-medium">{browser.name}</span>
-        <LaunchStatus state={state} />
+        <LaunchStatus
+          state={state}
+          normalOnly={normalOnly}
+          openCount={openCount}
+        />
       </span>
       <span
         aria-hidden="true"
@@ -413,26 +673,75 @@ function BrowserCard({
   );
 }
 
-function LaunchStatus({ state }: { state: LaunchState | undefined }) {
-  if (!state) return null;
+function LaunchStatus({
+  state,
+  normalOnly,
+  openCount,
+}: {
+  state: LaunchState | undefined;
+  normalOnly: boolean;
+  openCount: number;
+}) {
+  const muted = "text-xs text-zinc-500 dark:text-zinc-400";
+  const good = "text-xs text-emerald-700 dark:text-emerald-400";
+  const bad = "line-clamp-2 text-xs text-red-600 dark:text-red-400";
+
+  if (!state) {
+    if (openCount > 0) {
+      return <span className={muted}>{plural(openCount, "window")} open</span>;
+    }
+    return normalOnly ? <span className={muted}>Normal window only</span> : null;
+  }
   if (state.status === "opening") {
+    return <span className={muted}>Opening…</span>;
+  }
+  if (state.status === "closing") {
+    return <span className={muted}>Closing…</span>;
+  }
+  if (state.status === "closed") {
+    const { closed, error } = state.result;
+    if (error) {
+      return (
+        <span className={bad} title={error}>
+          {error}
+        </span>
+      );
+    }
     return (
-      <span className="text-xs text-zinc-500 dark:text-zinc-400">Opening…</span>
+      <span className={muted}>{closed > 0 ? "Closed" : "Already closed"}</span>
     );
   }
-  if (state.status === "opened") {
+
+  const { ok, error, privateWindow } = state.result;
+  if (!ok) {
+    const message = error ?? "Could not open this browser.";
+    const text =
+      privateWindow?.status === "opened"
+        ? `Only the incognito window opened. ${message}`
+        : message;
     return (
-      <span className="text-xs text-emerald-700 dark:text-emerald-400">
-        Opened
+      <span className={bad} title={text}>
+        {text}
+      </span>
+    );
+  }
+  if (privateWindow?.status === "failed") {
+    return (
+      <span className={bad} title={privateWindow.error}>
+        Opened, but incognito failed
+      </span>
+    );
+  }
+  if (privateWindow?.status === "unsupported") {
+    return (
+      <span className={good}>
+        Opened <span className={muted}>· normal only</span>
       </span>
     );
   }
   return (
-    <span
-      className="line-clamp-2 text-xs text-red-600 dark:text-red-400"
-      title={state.error}
-    >
-      {state.error}
+    <span className={good}>
+      {privateWindow ? "Opened + incognito" : "Opened"}
     </span>
   );
 }

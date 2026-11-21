@@ -27,7 +27,11 @@ export async function POST(request: Request) {
     return badRequest("The request body isn't valid JSON.");
   }
 
-  const { url: rawUrl, browsers } = (payload ?? {}) as Record<string, unknown>;
+  const {
+    url: rawUrl,
+    browsers,
+    includePrivate,
+  } = (payload ?? {}) as Record<string, unknown>;
 
   if (typeof rawUrl !== "string") {
     return badRequest("Missing the URL to open.");
@@ -52,6 +56,9 @@ export async function POST(request: Request) {
     return badRequest("Opening browsers is only supported on macOS for now.", 501);
   }
 
-  const body: OpenResponse = { url, results: await openInBrowsers(url, browsers) };
+  const results = await openInBrowsers(url, browsers, {
+    includePrivate: includePrivate === true,
+  });
+  const body: OpenResponse = { url, results };
   return Response.json(body);
 }
