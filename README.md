@@ -58,14 +58,20 @@ a normal window while the launcher reports it as private.
 - Only `http://` and `https://` addresses are opened.
 - **Each page gets its own window**, not a tab in a window you already had,
   so that closing it can't take anything of yours with it.
-- **Closing depends on the browser too.** Chrome, Brave, Edge, Opera, Safari
-  and Firefox are supported. Firefox can't say what a window contains, so the
+- **Closing depends on the browser too.** Chrome, Brave, Edge, Opera, Vivaldi,
+  Safari, DuckDuckGo, Firefox and Zen are supported; Orion and Arc are not yet
+  (their windows open, but you close them yourself). Firefox can't say what a window contains, so the
   launcher recognises its window as the one that appeared right after it
   asked; if several appear at once (Firefox restoring a session as it starts)
   it leaves them all alone and tells you.
-- **Safari's private window needs one more permission.** Safari has no command
-  for a private window, so the launcher presses Safari's own
-  *File → New Private Window* for you. For that, turn on the app running the
-  server under System Settings → Privacy & Security → Accessibility, and click
-  Allow when macOS asks about "System Events". Until then Safari opens its
-  normal window only and the page tells you what's missing.
+- **Safari and DuckDuckGo need one more permission.** Neither has a command
+  for a private window, so the launcher presses the browser's own menu item
+  for you (*New Private Window* in Safari, *New Fire Window* in DuckDuckGo).
+  For that, turn on the app running the server under System Settings →
+  Privacy & Security → Accessibility, and click Allow when macOS asks about
+  "System Events". Until then they open a normal window only, and the page
+  shows a reminder while either one is ticked.
+- **DuckDuckGo is driven like a person would.** It can't be scripted at all,
+  so the launcher also fills in its address bar and presses Return, and
+  closes its windows by pressing their close button. It goes last, after the
+  other browsers, so that key press can't land in another app.

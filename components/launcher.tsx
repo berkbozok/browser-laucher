@@ -183,6 +183,12 @@ function summarizeOpen(results: OpenResult[]): Notice | null {
       `macOS hasn't allowed the launcher to control ${nameList.format(notAllowed)}, so Close can't reach ${notAllowed.length === 1 ? "it" : "them"}. Allow it under System Settings → Privacy & Security → Automation.`,
     );
   }
+  const needAccess = namesWhere((r) => r.untracked === "needs-accessibility");
+  if (needAccess.length > 0) {
+    parts.push(
+      `Close can't reach ${nameList.format(needAccess)} until Accessibility is switched on for the launcher (System Settings → Privacy & Security → Accessibility).`,
+    );
+  }
   const byHand = namesWhere(
     (r) => r.untracked === "unsupported" || r.untracked === "unidentified",
   );

@@ -41,9 +41,15 @@ export type WindowHandle = {
  * Why a window that did open can't be closed by the launcher:
  * - "unsupported":  the browser can't be controlled from outside at all;
  * - "not-allowed":  macOS hasn't given permission to control it;
+ * - "needs-accessibility": it is driven through its menus, and macOS hasn't
+ *                   switched on Accessibility for that;
  * - "unidentified": it opened, but we couldn't tell which window is ours.
  */
-export type Untracked = "unsupported" | "not-allowed" | "unidentified";
+export type Untracked =
+  | "unsupported"
+  | "not-allowed"
+  | "needs-accessibility"
+  | "unidentified";
 
 /** How the extra private window went for one browser. */
 export type PrivateWindowResult =
