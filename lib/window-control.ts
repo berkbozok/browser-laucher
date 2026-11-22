@@ -21,13 +21,15 @@ export type ScriptingKind = "chromium" | "safari" | "firefox";
  * Switches for a Chrome-family browser that the launcher has to start. They
  * keep it from greeting us with things that sit on top of the page or wait
  * for an answer: the first-run welcome, "make this your default browser",
- * and "restore pages?" after it was force-quit. They last for that run of
- * the browser only.
+ * and "restore pages?" after it was force-quit. The last one keeps it
+ * drawing windows that are hidden behind others (Opera stops otherwise,
+ * and their live pictures go black). They last for that run only.
  */
 const QUIET_START = [
   "--no-first-run",
   "--no-default-browser-check",
   "--hide-crash-restore-bubble",
+  "--disable-backgrounding-occluded-windows",
 ];
 
 async function isRunning(appPath: string): Promise<boolean> {
@@ -425,6 +427,17 @@ function countOpenWindows(request, app) {
   }).length;
 }
 
+// Asks a browser to quit the way the Dock's Quit does. Safari quietly
+// ignores the scripting "quit" command sent from here, but not this.
+function quitApp(appPath, app) {
+  var running = runningApp(appPath);
+  if (running.pid !== 0) {
+    var copy = $.NSRunningApplication.runningApplicationWithProcessIdentifier(running.pid);
+    if (!copy.isNil() && copy.terminate) return;
+  }
+  try { app.quit(); } catch (error) {}
+}
+
 // request.quitRuns: runs of this browser that the launcher itself started.
 // If the browser is still on one of them and closing left it with no windows
 // at all, it is quit as well, so nothing of the user's can be open in it.
@@ -459,8 +472,12 @@ function closeWindows(request) {
     // Windows that were just closed can take a moment to go.
     var empty = waitUntil(function () { return countOpenWindows(request, app) === 0; }, 2.5);
     if (empty) {
-      app.quit();
-      quit = true;
+      // Check that it really went, and ask once more if it didn't.
+      var gone = function () { return pidOf(request.appPath) === 0; };
+      for (var asked = 0; asked < 2 && !quit; asked++) {
+        quitApp(request.appPath, app);
+        quit = waitUntil(gone, 4) === true;
+      }
     }
   }
   return { ok: true, outcomes: outcomes, quit: quit };

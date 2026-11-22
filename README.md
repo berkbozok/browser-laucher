@@ -68,6 +68,10 @@ things make pages differ that aren't the page's fault:
   again.
 - *Things that change by themselves*: pop-ups, banners, adverts, animations.
   They are marked because they really do look different.
+- *Hidden windows.* Safari and Opera stop drawing a window that is covered
+  by other windows, so its picture goes blank or stale. Keep the windows
+  visible (Tile after opening helps). Opera keeps drawing if the launcher
+  started it.
 
 The marks belong to the moment of comparing; Go to address, Reload and
 Arrange clear them, and **Compare again** retakes them.
