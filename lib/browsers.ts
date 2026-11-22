@@ -199,6 +199,14 @@ const CATALOG: readonly BrowserDefinition[] = [
     scripting: "firefox",
   },
   {
+    id: "floorp",
+    name: "Floorp",
+    engine: "firefox",
+    macApps: ["Floorp.app"],
+    privateFlag: "--private-window",
+    scripting: "firefox",
+  },
+  {
     id: "orion",
     name: "Orion",
     engine: "webkit",
