@@ -18,6 +18,6 @@ export async function GET(
   if (!picture) return new Response(null, { status: 404 });
 
   return new Response(new Uint8Array(picture), {
-    headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" },
+    headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
   });
 }

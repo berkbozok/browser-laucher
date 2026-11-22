@@ -1,29 +1,50 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { pictureOfWindow } from "./preview";
+import { arrange, type Layout } from "./layout";
+import { pictureOfWindow, saveWindowPicture } from "./preview";
 import type {
+  ActionResult,
+  BrowserInfo,
   CloseResult,
   FocusResponse,
   OpenResult,
   OpenWindow,
+  SetupResponse,
+  SnapshotsResponse,
   Untracked,
   WindowHandle,
+  WindowSelection,
   WindowsResponse,
 } from "./types";
 import {
+  forgetStartedBrowsers,
   forgetWindows,
   listRegisteredWindows,
+  listStartedBrowsers,
+  noteStartedBrowsers,
   registerWindows,
+  retargetWindows,
   type RegisteredWindow,
+  type StartedBrowser,
 } from "./window-registry";
 import {
+  arrangeTrackedWindows,
+  boundsOfTrackedWindows,
+  checkControl,
+  checkPermissions,
   closeTrackedWindows,
   describeTrackedWindows,
   focusTrackedWindow,
+  navigateTrackedWindows,
   openTrackedWindow,
+  quitBrowserIfEmpty,
+  reloadTrackedWindows,
+  usableScreenArea,
+  type ActedHow,
+  type ActOutcome,
   type CommandLineSteps,
   type ScriptingKind,
 } from "./window-control";
@@ -33,6 +54,8 @@ const run = promisify(execFile);
 type BrowserDefinition = {
   id: string;
   name: string;
+  /** The family it belongs to, for picking a group of browsers at once. */
+  engine: BrowserInfo["engine"];
   /** App bundle names to look for on macOS. */
   macApps: readonly string[];
   /**
@@ -61,16 +84,17 @@ type BrowserDefinition = {
 /**
  * Every browser the launcher knows about. To support another one, add it here.
  *
- * Opening, private windows and closing were checked on Chrome, Brave,
- * Firefox, Safari, Opera, Edge, Vivaldi and Zen. The remaining entries that
- * have a private switch are built on the same engines and use the same one.
- * Entries without `scripting` (DuckDuckGo, Orion, Arc, Tor) just get the page
- * handed to them: a normal window only, closed by hand.
+ * Everything was checked on Chrome, Brave, Firefox, Safari, Opera, Edge,
+ * Vivaldi, Zen and Orion ("npm run test:live" does it again). The remaining
+ * entries with `scripting` are built on the same engines. Entries without it
+ * (DuckDuckGo, Arc, Tor) just get the page handed to them: a normal window
+ * only, which the launcher can't follow.
  */
 const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "chrome",
     name: "Google Chrome",
+    engine: "chromium",
     macApps: ["Google Chrome.app"],
     privateFlag: "--incognito",
     scripting: "chromium",
@@ -78,6 +102,7 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "brave",
     name: "Brave",
+    engine: "chromium",
     macApps: ["Brave Browser.app"],
     privateFlag: "--incognito",
     scripting: "chromium",
@@ -85,6 +110,7 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "firefox",
     name: "Firefox",
+    engine: "firefox",
     macApps: ["Firefox.app"],
     privateFlag: "--private-window",
     scripting: "firefox",
@@ -92,12 +118,14 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "safari",
     name: "Safari",
+    engine: "webkit",
     macApps: ["Safari.app"],
     scripting: "safari",
   },
   {
     id: "opera",
     name: "Opera",
+    engine: "chromium",
     macApps: ["Opera.app"],
     privateFlag: "--private",
     linksFollowLastWindow: true,
@@ -106,14 +134,21 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "edge",
     name: "Microsoft Edge",
+    engine: "chromium",
     macApps: ["Microsoft Edge.app"],
     privateFlag: "--inprivate",
     scripting: "chromium",
   },
-  { id: "arc", name: "Arc", macApps: ["Arc.app"] },
+  {
+    id: "arc",
+    name: "Arc",
+    engine: "chromium",
+    macApps: ["Arc.app"],
+  },
   {
     id: "vivaldi",
     name: "Vivaldi",
+    engine: "chromium",
     macApps: ["Vivaldi.app"],
     privateFlag: "--incognito",
     scripting: "chromium",
@@ -121,6 +156,7 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "opera-gx",
     name: "Opera GX",
+    engine: "chromium",
     macApps: ["Opera GX.app"],
     privateFlag: "--private",
     linksFollowLastWindow: true,
@@ -129,23 +165,42 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "chromium",
     name: "Chromium",
+    engine: "chromium",
     macApps: ["Chromium.app"],
     privateFlag: "--incognito",
     scripting: "chromium",
   },
-  { id: "duckduckgo", name: "DuckDuckGo", macApps: ["DuckDuckGo.app"] },
+  {
+    id: "duckduckgo",
+    name: "DuckDuckGo",
+    engine: "webkit",
+    macApps: ["DuckDuckGo.app"],
+  },
   {
     id: "zen",
     name: "Zen",
+    engine: "firefox",
     macApps: ["Zen.app", "Zen Browser.app"],
     privateFlag: "--private-window",
     scripting: "firefox",
   },
-  { id: "orion", name: "Orion", macApps: ["Orion.app"] },
-  { id: "tor", name: "Tor Browser", macApps: ["Tor Browser.app"] },
+  {
+    id: "orion",
+    name: "Orion",
+    engine: "webkit",
+    macApps: ["Orion.app"],
+    scripting: "safari",
+  },
+  {
+    id: "tor",
+    name: "Tor Browser",
+    engine: "firefox",
+    macApps: ["Tor Browser.app"],
+  },
   {
     id: "firefox-dev",
     name: "Firefox Developer Edition",
+    engine: "firefox",
     macApps: ["Firefox Developer Edition.app"],
     privateFlag: "--private-window",
     scripting: "firefox",
@@ -153,6 +208,7 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "chrome-canary",
     name: "Chrome Canary",
+    engine: "chromium",
     macApps: ["Google Chrome Canary.app"],
     privateFlag: "--incognito",
     scripting: "chromium",
@@ -160,6 +216,7 @@ const CATALOG: readonly BrowserDefinition[] = [
   {
     id: "safari-tp",
     name: "Safari Technology Preview",
+    engine: "webkit",
     macApps: ["Safari Technology Preview.app"],
     scripting: "safari",
   },
@@ -168,6 +225,7 @@ const CATALOG: readonly BrowserDefinition[] = [
 export type DetectedBrowser = {
   id: string;
   name: string;
+  engine: BrowserInfo["engine"];
   /** Absolute path of the installed app, or null when it isn't installed. */
   appPath: string | null;
   /** Switch for opening a private window, or null when the browser has none. */
@@ -214,6 +272,7 @@ export async function detectBrowsers(): Promise<DetectedBrowser[]> {
     CATALOG.map(async (definition) => ({
       id: definition.id,
       name: definition.name,
+      engine: definition.engine,
       appPath: isSupportedPlatform ? await findApp(definition.macApps) : null,
       privateFlag: definition.privateFlag ?? null,
       // Safari has no switch, but its menu can be pressed (see window-control).
@@ -291,7 +350,8 @@ function firefoxSteps(
 }
 
 type WindowOutcome =
-  | { ok: true; handle: WindowHandle }
+  /** `startedBrowser`: the browser wasn't running and was launched for this. */
+  | { ok: true; handle: WindowHandle; startedBrowser?: boolean }
   | { ok: true; handle?: undefined; untracked: Untracked; detail?: string }
   | { ok: false; error: string };
 
@@ -327,7 +387,11 @@ async function openWindow(
       });
       if (tracked.opened) {
         return tracked.handle
-          ? { ok: true, handle: tracked.handle }
+          ? {
+              ok: true,
+              handle: tracked.handle,
+              startedBrowser: tracked.startedBrowser,
+            }
           : { ok: true, untracked: "unidentified", detail: tracked.detail };
       }
       if (tracked.privateUnavailable) {
@@ -371,6 +435,8 @@ export async function openInBrowsers(
   { includePrivate = false }: { includePrivate?: boolean } = {},
 ): Promise<OpenResult[]> {
   const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  // Browsers that weren't running and that we started for this launch.
+  const started: StartedBrowser[] = [];
 
   const openOne = async (id: string): Promise<OpenResult> => {
     const found = detected.get(id);
@@ -396,6 +462,10 @@ export async function openInBrowsers(
       result.untrackedDetail = outcome.detail;
     };
     if (normal.ok) result.handle = normal.handle;
+    if (normal.ok && normal.handle && normal.startedBrowser) {
+      const { pid, startedAt } = normal.handle;
+      started.push({ browser: id, pid, startedAt });
+    }
     noteUntracked(normal);
 
     // The normal window goes first so a browser that wasn't running is
@@ -437,6 +507,7 @@ export async function openInBrowsers(
       return windows;
     }),
   );
+  await noteStartedBrowsers(started);
   return results;
 }
 
@@ -454,6 +525,11 @@ function notAllowedMessage(name: string): string {
   return `macOS hasn't allowed the launcher to control ${name}. Allow it under System Settings → Privacy & Security → Automation.`;
 }
 
+/** What to tell someone when a step needs the launcher to press a menu. */
+function accessibilityMessage(name: string): string {
+  return `${name} can only do this when the launcher presses its menu, and macOS has to allow that: turn on the app running the launcher (Terminal, Cursor, …) under System Settings → Privacy & Security → Accessibility.`;
+}
+
 function byBrowser(
   windows: readonly RegisteredWindow[],
 ): Map<string, RegisteredWindow[]> {
@@ -464,6 +540,28 @@ function byBrowser(
     else groups.set(item.browser, [item]);
   }
   return groups;
+}
+
+/** The launcher's windows a request is about, grouped by browser. */
+async function selectWindows(
+  selection: WindowSelection,
+): Promise<Map<string, RegisteredWindow[]>> {
+  const keys = selection.keys ? new Set(selection.keys) : null;
+  const ids = new Set(selection.browsers ?? []);
+  const registered = await listRegisteredWindows();
+  return byBrowser(
+    registered.filter((item) =>
+      keys ? keys.has(item.key) : ids.has(item.browser),
+    ),
+  );
+}
+
+/** A browser the launcher can drive: installed, and scriptable. */
+type Drivable = InstalledBrowser & { scripting: ScriptingKind };
+
+function drivable(browser: DetectedBrowser | undefined): Drivable | null {
+  if (!browser?.appPath || !browser.scripting) return null;
+  return { ...browser, appPath: browser.appPath, scripting: browser.scripting };
 }
 
 /**
@@ -481,8 +579,8 @@ export async function listOpenWindows(): Promise<WindowsResponse> {
 
   const groups = await Promise.all(
     [...byBrowser(registered)].map(async ([id, items]): Promise<OpenWindow[]> => {
-      const browser = detected.get(id);
-      if (!browser?.appPath || !browser.scripting) {
+      const browser = drivable(detected.get(id));
+      if (!browser) {
         // The browser was removed. Nothing can be done with these any more.
         items.forEach((item) => gone.add(item.key));
         return [];
@@ -525,25 +623,27 @@ export async function listOpenWindows(): Promise<WindowsResponse> {
 }
 
 /**
- * Closes the launcher's windows in the given browsers. Windows that are
- * already gone (closed by hand, or the browser was restarted) are counted,
- * not treated as errors.
+ * Closes the selected windows. Windows that are already gone (closed by
+ * hand, or the browser was restarted) are counted, not treated as errors.
+ * With `quitStarted`, a browser the launcher itself had started is quit
+ * again once it has no windows left.
  */
-export async function closeInBrowsers(
-  ids: readonly string[],
+export async function closeOpenWindows(
+  selection: WindowSelection,
+  { quitStarted = false }: { quitStarted?: boolean } = {},
 ): Promise<CloseResult[]> {
   const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
-  const registered = byBrowser(await listRegisteredWindows());
+  const groups = await selectWindows(selection);
+  const started = quitStarted ? await listStartedBrowsers() : [];
   const done = new Set<string>();
+  const finishedRuns: StartedBrowser[] = [];
 
   const results = await Promise.all(
-    [...new Set(ids)].map(async (id): Promise<CloseResult | null> => {
-      const items = registered.get(id);
-      if (!items) return null; // Nothing of ours is open in this browser.
-      const browser = detected.get(id);
-      const name = browser?.name ?? id;
+    [...groups].map(async ([id, items]): Promise<CloseResult> => {
+      const browser = drivable(detected.get(id));
+      const name = detected.get(id)?.name ?? id;
       const nothing = { id, name, closed: 0, alreadyGone: 0 };
-      if (!browser?.appPath || !browser.scripting) {
+      if (!browser) {
         return { ...nothing, error: "This browser's windows can't be closed from here." };
       }
 
@@ -566,37 +666,301 @@ export async function closeInBrowsers(
       items.forEach((item, index) => {
         if (outcome.outcomes[index] !== "stuck") done.add(item.key);
       });
-      const counts = { id, name, closed: count("closed"), alreadyGone: count("gone") };
-      const stuck = count("stuck");
-      if (stuck === 0) return counts;
-      const those = stuck === 1 ? "One window" : `${stuck} windows`;
-      return {
-        ...counts,
-        error: `${those} stayed open; the page may be asking before it lets go. Close ${stuck === 1 ? "it" : "them"} by hand, or press Close again.`,
+      const result: CloseResult = {
+        id,
+        name,
+        closed: count("closed"),
+        alreadyGone: count("gone"),
       };
+
+      for (const run of started.filter((r) => r.browser === id)) {
+        if (await quitBrowserIfEmpty(browser.scripting, browser.appPath, run)) {
+          result.quit = true;
+          finishedRuns.push(run);
+        }
+      }
+
+      const stuck = count("stuck");
+      if (stuck > 0) {
+        const those = stuck === 1 ? "One window" : `${stuck} windows`;
+        result.error = `${those} stayed open; the page may be asking before it lets go. Close ${stuck === 1 ? "it" : "them"} by hand, or press Close again.`;
+      }
+      return result;
     }),
   );
 
   await forgetWindows(done);
-  return results.filter((result) => result !== null);
+  await forgetStartedBrowsers(finishedRuns);
+  return results;
+}
+
+/**
+ * Runs `act` on the selected windows, one call per browser, and tallies how
+ * it went. Windows that turn out to be gone are forgotten.
+ */
+async function actOnWindows(
+  selection: WindowSelection,
+  act: (browser: Drivable, items: RegisteredWindow[]) => Promise<ActOutcome>,
+  afterwards?: (did: RegisteredWindow[]) => Promise<void>,
+): Promise<ActionResult[]> {
+  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  const groups = await selectWindows(selection);
+  const gone = new Set<string>();
+  const did: RegisteredWindow[] = [];
+
+  const results = await Promise.all(
+    [...groups].map(async ([id, items]): Promise<ActionResult> => {
+      const browser = drivable(detected.get(id));
+      const name = detected.get(id)?.name ?? id;
+      const nothing = { id, name, done: 0, gone: 0 };
+      if (!browser) {
+        return { ...nothing, error: "This browser's windows can't be reached from here." };
+      }
+
+      const outcome = await act(browser, items);
+      if (!outcome.ok) {
+        return {
+          ...nothing,
+          error: outcome.needsAccessibility
+            ? accessibilityMessage(name)
+            : outcome.notAllowed
+              ? notAllowedMessage(name)
+              : outcome.detail,
+        };
+      }
+
+      items.forEach((item, index) => {
+        if (outcome.outcomes[index] === "gone") gone.add(item.key);
+        if (outcome.outcomes[index] === "done") did.push(item);
+      });
+      const count = (how: ActedHow) =>
+        outcome.outcomes.filter((o) => o === how).length;
+      const result: ActionResult = {
+        id,
+        name,
+        done: count("done"),
+        gone: count("gone"),
+      };
+      if (count("unsupported") > 0) {
+        result.error = `${name} couldn't do that for ${count("unsupported") === 1 ? "one window" : `${count("unsupported")} windows`}.`;
+      }
+      return result;
+    }),
+  );
+
+  await forgetWindows(gone);
+  await afterwards?.(did);
+  return results;
+}
+
+/**
+ * Firefox can't be told to load an address in a window it already has, nor
+ * to reload one. So each of its windows is swapped for a new one, opened on
+ * `url` (or, to reload, on the address the old one was opened on) and put
+ * where the old one was.
+ */
+async function replaceWindows(
+  browser: Drivable,
+  items: RegisteredWindow[],
+  url: string | null,
+): Promise<ActOutcome> {
+  const places = await boundsOfTrackedWindows(
+    browser.scripting,
+    browser.appPath,
+    items.map((item) => item.handle),
+  );
+  const outcomes: ActedHow[] = [];
+  for (const [index, item] of items.entries()) {
+    const place = places[index];
+    if (!place) {
+      outcomes.push("gone");
+      continue;
+    }
+    const address = url ?? item.url;
+    const fresh = await openWindow(browser, address, {
+      isPrivate: item.private,
+      track: true,
+    });
+    if (!fresh.ok || !fresh.handle) {
+      outcomes.push("unsupported");
+      continue;
+    }
+    await registerWindows([
+      {
+        browser: item.browser,
+        handle: fresh.handle,
+        private: item.private,
+        url: address,
+        launch: item.launch,
+      },
+    ]);
+    await arrangeTrackedWindows(browser.scripting, browser.appPath, [
+      { handle: fresh.handle, bounds: place },
+    ]);
+    await closeTrackedWindows(browser.scripting, browser.appPath, [item.handle]);
+    await forgetWindows(new Set([item.key]));
+    outcomes.push("done");
+  }
+  return { ok: true, outcomes };
+}
+
+/**
+ * Sends the selected windows to a new address. `url` must already be
+ * validated (see normalizeUrl).
+ */
+export function navigateOpenWindows(
+  selection: WindowSelection,
+  url: string,
+): Promise<ActionResult[]> {
+  return actOnWindows(
+    selection,
+    (browser, items) =>
+      browser.scripting === "firefox"
+        ? replaceWindows(browser, items, url)
+        : navigateTrackedWindows(
+            browser.scripting,
+            browser.appPath,
+            items.map((item) => item.handle),
+            url,
+          ),
+    // Windows that were swapped are already registered under the new address.
+    (did) => retargetWindows(new Set(did.map((item) => item.key)), url),
+  );
+}
+
+/** Reloads the page in the selected windows. */
+export function reloadOpenWindows(
+  selection: WindowSelection,
+): Promise<ActionResult[]> {
+  return actOnWindows(selection, (browser, items) =>
+    browser.scripting === "firefox"
+      ? replaceWindows(browser, items, null)
+      : reloadTrackedWindows(
+          browser.scripting,
+          browser.appPath,
+          items.map((item) => item.handle),
+        ),
+  );
+}
+
+/** The selected windows in the order the page lists them. */
+function inListOrder(
+  groups: Map<string, RegisteredWindow[]>,
+  order: readonly string[],
+): RegisteredWindow[] {
+  return order.flatMap((id) =>
+    [...(groups.get(id) ?? [])].sort(
+      (x, y) => y.launch - x.launch || Number(x.private) - Number(y.private),
+    ),
+  );
+}
+
+/** Lays the selected windows out on the main screen. */
+export async function arrangeOpenWindows(
+  selection: WindowSelection,
+  layout: Layout,
+): Promise<ActionResult[]> {
+  const area = await usableScreenArea();
+  if (!area) throw new Error("The size of the screen couldn't be read.");
+
+  const order = (await detectBrowsers()).map((b) => b.id);
+  const all = inListOrder(await selectWindows(selection), order);
+  const spots = new Map(
+    arrange(area, all.length, layout).map((rect, index) => [all[index].key, rect]),
+  );
+
+  return actOnWindows(selection, (browser, items) =>
+    arrangeTrackedWindows(
+      browser.scripting,
+      browser.appPath,
+      // A window that appeared since the spots were handed out keeps its place.
+      items.flatMap((item) => {
+        const bounds = spots.get(item.key);
+        return bounds ? [{ handle: item.handle, bounds }] : [];
+      }),
+    ).then((outcome): ActOutcome => {
+      if (!outcome.ok) return outcome;
+      // Line the answers back up with `items`.
+      let next = 0;
+      return {
+        ok: true,
+        outcomes: items.map((item) =>
+          spots.has(item.key) ? outcome.outcomes[next++] : "unsupported",
+        ),
+      };
+    }),
+  );
+}
+
+const two = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * Saves a full-size picture of each selected window into a new folder under
+ * ~/Pictures/Browser Launcher and shows the folder in Finder.
+ */
+export async function saveOpenWindowPictures(
+  selection: WindowSelection,
+): Promise<SnapshotsResponse> {
+  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  const all = inListOrder(await selectWindows(selection), [...detected.keys()]);
+  if (all.length === 0) return { folder: null, saved: 0, missed: [] };
+
+  const now = new Date();
+  const stamp = `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())} ${two(now.getHours())}.${two(now.getMinutes())}.${two(now.getSeconds())}`;
+  const folder = path.join(
+    /* turbopackIgnore: true */ homedir(),
+    "Pictures",
+    "Browser Launcher",
+    stamp,
+  );
+  await mkdir(folder, { recursive: true });
+
+  const used = new Map<string, number>();
+  const outcomes = await Promise.all(
+    all.map(async (item) => {
+      const name = detected.get(item.browser)?.name ?? item.browser;
+      const base = `${name} - ${item.private ? "incognito" : "normal"}`;
+      const seen = (used.get(base) ?? 0) + 1;
+      used.set(base, seen);
+      const label = seen === 1 ? base : `${base} ${seen}`;
+      const screenId = item.handle.screenId;
+      const saved =
+        typeof screenId === "number" &&
+        (await saveWindowPicture(
+          screenId,
+          path.join(/* turbopackIgnore: true */ folder, `${label}.png`),
+        ));
+      return { label, saved };
+    }),
+  );
+
+  const saved = outcomes.filter((o) => o.saved).length;
+  const missed = outcomes.filter((o) => !o.saved).map((o) => o.label);
+  if (saved === 0) {
+    await rm(folder, { recursive: true, force: true });
+    return {
+      folder: null,
+      saved: 0,
+      missed,
+      error:
+        "No pictures could be taken. macOS has to allow the app running the launcher to record the screen: System Settings → Privacy & Security → Screen & System Audio Recording.",
+    };
+  }
+  // Show the folder. Not worth failing over if Finder doesn't oblige.
+  await runOpen([folder]).catch(() => undefined);
+  return { folder, saved, missed };
 }
 
 async function findRegistered(key: string): Promise<{
   item: RegisteredWindow;
-  appPath: string;
-  scripting: ScriptingKind;
-  name: string;
+  browser: Drivable;
 } | null> {
   const item = (await listRegisteredWindows()).find((w) => w.key === key);
   if (!item) return null;
-  const browser = (await detectBrowsers()).find((b) => b.id === item.browser);
-  if (!browser?.appPath || !browser.scripting) return null;
-  return {
-    item,
-    appPath: browser.appPath,
-    scripting: browser.scripting,
-    name: browser.name,
-  };
+  const browser = drivable(
+    (await detectBrowsers()).find((b) => b.id === item.browser),
+  );
+  return browser ? { item, browser } : null;
 }
 
 /**
@@ -608,13 +972,15 @@ export async function focusOpenWindow(key: string): Promise<FocusResponse> {
   if (!found) return { gone: true, inFront: false };
 
   const outcome = await focusTrackedWindow(
-    found.scripting,
-    found.appPath,
+    found.browser.scripting,
+    found.browser.appPath,
     found.item.handle,
   );
   if (!outcome.ok) {
     throw new Error(
-      outcome.notAllowed ? notAllowedMessage(found.name) : outcome.detail,
+      outcome.notAllowed
+        ? notAllowedMessage(found.browser.name)
+        : outcome.detail,
     );
   }
   if (outcome.gone) await forgetWindows(new Set([key]));
@@ -622,7 +988,7 @@ export async function focusOpenWindow(key: string): Promise<FocusResponse> {
 }
 
 /**
- * A JPEG of one of the launcher's windows as it looks right now, or null if
+ * A PNG of one of the launcher's windows as it looks right now, or null if
  * there is none to be had. Only windows the launcher opened can be asked
  * for; nothing else on the screen is reachable through this.
  */
@@ -631,6 +997,26 @@ export async function pictureOfOpenWindow(key: string): Promise<Buffer | null> {
   const screenId = item?.handle.screenId;
   if (typeof screenId !== "number") return null;
   return pictureOfWindow(screenId);
+}
+
+/**
+ * Which macOS permissions the launcher has. Asking whether a browser may be
+ * controlled makes macOS put the question to the person the first time, so
+ * this is only run when they ask for it.
+ */
+export async function checkSetup(): Promise<SetupResponse> {
+  const installed = (await detectBrowsers()).flatMap((b) => drivable(b) ?? []);
+  const [permissions, controls] = await Promise.all([
+    checkPermissions(),
+    Promise.all(
+      installed.map(async (browser) => ({
+        id: browser.id,
+        name: browser.name,
+        control: await checkControl(browser.appPath),
+      })),
+    ),
+  ]);
+  return { ...permissions, browsers: controls };
 }
 
 async function renderIcon(appPath: string): Promise<Buffer> {

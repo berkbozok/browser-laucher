@@ -95,7 +95,8 @@ function screenIdOf(request, windowId) {
 }
 
 // The reply for a window that is now open and can be found again.
-function opened(request, windowId) {
+// "startedBrowser": the browser wasn't running and we launched it for this.
+function opened(request, windowId, startedBrowser) {
   var app = runningApp(request.appPath);
   var screenId = waitUntil(function () { return screenIdOf(request, windowId); }, 2);
   return {
@@ -104,7 +105,19 @@ function opened(request, windowId) {
     pid: app.pid,
     startedAt: app.startedAt,
     screenId: screenId,
+    startedBrowser: startedBrowser === true,
   };
+}
+
+// Turns an error from pressing something in another app's interface into a
+// reply. macOS words a missing Accessibility permission as "not allowed
+// assistive access"; anything else is the interface not being in the state
+// we expected, which is worth reporting as what it is.
+function interfaceProblem(error) {
+  if (error.errorNumber === -1743) throw error;
+  var message = String(error.message || error);
+  var refused = error.errorNumber === -25211 || /assistive access/i.test(message);
+  return { ok: false, code: null, needsAccessibility: refused, message: message };
 }
 
 // Whether this process may take pictures of other apps' windows (the Screen
@@ -172,7 +185,8 @@ function makeChromiumWindow(app, properties) {
 function openChromium(request) {
   var app = Application(request.appPath);
   var id = null;
-  if (pidOf(request.appPath) === 0) {
+  var wasClosed = pidOf(request.appPath) === 0;
+  if (wasClosed) {
     coldStart(app);
     if (!request.private) id = chromiumBlankWindow(app);
   }
@@ -197,7 +211,7 @@ function openChromium(request) {
   }, 4);
   if (!loaded) throw new Error("The new window never became ready for an address.");
   app.activate();
-  return opened(request, id);
+  return opened(request, id, wasClosed);
 }
 
 function safariBlankWindow(app) {
@@ -237,13 +251,7 @@ function openSafariPrivate(app, request) {
       return { ok: false, code: null, message: "Safari's New Private Window menu item wasn't found." };
     }
   } catch (error) {
-    if (error.errorNumber === -1743) throw error;
-    var message = String(error.message || error);
-    // macOS words a missing Accessibility permission as "not allowed
-    // assistive access". Anything else is the menu not being in the state we
-    // expected, which is worth reporting as what it is.
-    var refused = error.errorNumber === -25211 || /assistive access/i.test(message);
-    return { ok: false, code: null, needsAccessibility: refused, message: message };
+    return interfaceProblem(error);
   }
   var fresh = waitUntil(function () {
     var ids = app.windows.id().filter(function (id) { return before.indexOf(id) === -1; });
@@ -253,7 +261,7 @@ function openSafariPrivate(app, request) {
     return { ok: false, code: null, message: "Safari didn't open a private window." };
   }
   app.windows.byId(fresh[0]).currentTab.url = request.url;
-  return opened(request, fresh[0]);
+  return opened(request, fresh[0], false);
 }
 
 function openSafari(request) {
@@ -283,7 +291,7 @@ function openSafari(request) {
     id = fresh[0];
   }
   app.activate();
-  return opened(request, id);
+  return opened(request, id, wasClosed);
 }
 
 // Ids of the real browser windows, ignoring panels and tooltips. Each property
@@ -439,7 +447,142 @@ function focusWindow(request) {
   return { ok: true, gone: false, inFront: String(front) === String(request.handle.windowId) };
 }
 
+// ---- Acting on windows that are already open --------------------------------
+// Each of these answers with one outcome per handle, in the order they came:
+// "done", "gone" (the window isn't there any more) or "unsupported".
+
+// Sends each window to a new address. Firefox can't be told this way.
+function navigateWindows(request) {
+  var running = runningApp(request.appPath);
+  var outcomes = request.handles.map(function (handle) {
+    var win = windowFor(request, running, handle);
+    if (!win) return "gone";
+    if (request.kind === "chromium") win.activeTab.url = request.url;
+    else if (request.kind === "safari") win.currentTab.url = request.url;
+    else return "unsupported";
+    return "done";
+  });
+  return { ok: true, outcomes: outcomes };
+}
+
+// Firefox has neither a command nor a menu item for this; it answers
+// "unsupported" and the caller swaps its window for a fresh one instead.
+function reloadWindows(request) {
+  var running = runningApp(request.appPath);
+  var outcomes = request.handles.map(function (handle) {
+    var win = windowFor(request, running, handle);
+    if (!win) return "gone";
+    if (request.kind === "chromium") {
+      win.activeTab.reload();
+      return "done";
+    }
+    if (request.kind === "safari") {
+      // Safari has no reload command; giving a tab its own address again
+      // loads it afresh.
+      var tab = win.currentTab;
+      tab.url = tab.url();
+      return "done";
+    }
+    return "unsupported";
+  });
+  return { ok: true, outcomes: outcomes };
+}
+
+// Where each window is on the screen, or null for one that is gone.
+function boundsOfWindows(request) {
+  var running = runningApp(request.appPath);
+  var bounds = request.handles.map(function (handle) {
+    var win = windowFor(request, running, handle);
+    if (!win) return null;
+    var b = win.bounds();
+    return { x: b.x, y: b.y, width: b.width, height: b.height };
+  });
+  return { ok: true, bounds: bounds };
+}
+
+// The part of the main screen that windows may use, measured from the top
+// left corner the way window positions are.
+function screenArea() {
+  var visible = $.NSScreen.mainScreen.visibleFrame;
+  // AppKit measures from the bottom of the first screen instead.
+  var firstScreenHeight = $.NSScreen.screens.objectAtIndex(0).frame.size.height;
+  return {
+    ok: true,
+    x: Math.round(visible.origin.x),
+    y: Math.round(firstScreenHeight - visible.origin.y - visible.size.height),
+    width: Math.round(visible.size.width),
+    height: Math.round(visible.size.height),
+  };
+}
+
+// Moves and sizes windows. request.items: [{ handle, bounds }].
+function arrangeWindows(request) {
+  var running = runningApp(request.appPath);
+  var outcomes = request.items.map(function (item) {
+    var win = windowFor(request, running, item.handle);
+    if (!win) return "gone";
+    if (isMinimized(win)) {
+      try { win.miniaturized = false; } catch (e) {
+        try { win.minimized = false; } catch (e2) {}
+      }
+    }
+    win.bounds = item.bounds;
+    return "done";
+  });
+  return { ok: true, outcomes: outcomes };
+}
+
+// Quits the browser if this is still the run the launcher started and it has
+// no windows left, so nothing of the user's can be open in it.
+function quitIfEmpty(request) {
+  var running = runningApp(request.appPath);
+  var sameRun = running.pid !== 0 && running.pid === request.run.pid &&
+    running.startedAt === request.run.startedAt;
+  if (!sameRun) return { ok: true, quit: false, stillThatRun: false };
+
+  var app = Application(request.appPath);
+  var countOpen = function () {
+    if (request.kind === "chromium") return app.windows.length;
+    if (request.kind === "firefox") return browserWindowIds(app).length;
+    // Safari goes on listing closed windows for a while, invisible.
+    return app.windows().filter(function (w) {
+      try { return w.visible() || isMinimized(w); } catch (e) { return false; }
+    }).length;
+  };
+  // Windows that were just closed can take a moment to go.
+  var empty = waitUntil(function () { return countOpen() === 0; }, 2.5);
+  if (!empty) return { ok: true, quit: false, stillThatRun: true };
+  app.quit();
+  return { ok: true, quit: true, stillThatRun: false };
+}
+
+// The two permissions that can be looked up without asking for them.
+function checkPermissions() {
+  var accessibility = null;
+  try {
+    ObjC.bindFunction("AXIsProcessTrusted", ["bool", []]);
+    accessibility = !!$.AXIsProcessTrusted();
+  } catch (error) {}
+  return { ok: true, screenRecording: mayCapture(), accessibility: accessibility };
+}
+
+// Whether the launcher may control one browser. There is no way to look this
+// up quietly: the first time, macOS answers by asking the person.
+function checkControl(request) {
+  if (pidOf(request.appPath) === 0) return { ok: true, running: false };
+  Application(request.appPath).windows.length;
+  return { ok: true, running: true };
+}
+
 var ACTIONS = {
+  "navigate-windows": navigateWindows,
+  "reload-windows": reloadWindows,
+  "window-bounds": boundsOfWindows,
+  "screen-area": screenArea,
+  "arrange-windows": arrangeWindows,
+  "quit-if-empty": quitIfEmpty,
+  "check-permissions": checkPermissions,
+  "check-control": checkControl,
   "open-chromium": openChromium,
   "open-safari": openSafari,
   "list-windows": listWindows,
@@ -497,7 +640,8 @@ async function script<T>(request: Record<string, unknown>): Promise<Reply<T>> {
 }
 
 export type TrackedOpen =
-  | { opened: true; handle: WindowHandle }
+  /** `startedBrowser`: the browser wasn't running and was launched for this. */
+  | { opened: true; handle: WindowHandle; startedBrowser: boolean }
   /** The window is open, but we couldn't tell which one it is. */
   | { opened: true; handle: null; detail: string }
   /** Nothing was opened this way. */
@@ -547,7 +691,8 @@ async function openByWatchingWindows(
   if (!before.ok) return refused(before);
 
   let unsettled: string | null = null;
-  if (before.pid === 0) {
+  const startedBrowser = before.pid === 0;
+  if (startedBrowser) {
     // Not running. Started with a page to open, it could put that page in
     // the same window as tabs it restores, and closing "our" window would
     // then close those too. So start it bare, let it bring back whatever it
@@ -577,6 +722,7 @@ async function openByWatchingWindows(
   if (after?.ok && after.ids.length === 1) {
     return {
       opened: true,
+      startedBrowser,
       handle: {
         windowId: after.ids[0],
         pid: after.pid,
@@ -616,7 +762,8 @@ export async function openTrackedWindow(options: {
   }
 
   const reply = await script<
-    WindowHandle | { windowId?: undefined; unidentified: string }
+    | (WindowHandle & { startedBrowser?: boolean })
+    | { windowId?: undefined; unidentified: string }
   >({
     action: kind === "safari" ? "open-safari" : "open-chromium",
     kind,
@@ -631,6 +778,7 @@ export async function openTrackedWindow(options: {
   }
   return {
     opened: true,
+    startedBrowser: reply.startedBrowser === true,
     handle: {
       windowId: reply.windowId,
       pid: reply.pid,
@@ -731,4 +879,130 @@ export async function focusTrackedWindow(
     };
   }
   return { ok: true, gone: reply.gone, inFront: reply.inFront === true };
+}
+
+/** What happened to one window when it was asked to do something. */
+export type ActedHow = "done" | "gone" | "unsupported";
+
+export type ActOutcome =
+  /** One entry per handle, in the order they were given. */
+  | { ok: true; outcomes: ActedHow[] }
+  | {
+      ok: false;
+      notAllowed: boolean;
+      needsAccessibility: boolean;
+      detail: string;
+    };
+
+function acted(reply: Reply<{ outcomes: ActedHow[] }>): ActOutcome {
+  if (reply.ok) return { ok: true, outcomes: reply.outcomes };
+  return {
+    ok: false,
+    notAllowed: reply.code === NOT_ALLOWED,
+    needsAccessibility: reply.needsAccessibility === true,
+    detail: reply.message,
+  };
+}
+
+/** Sends windows to a new address. Firefox answers "unsupported". */
+export async function navigateTrackedWindows(
+  kind: ScriptingKind,
+  appPath: string,
+  handles: readonly WindowHandle[],
+  url: string,
+): Promise<ActOutcome> {
+  return acted(
+    await script({ action: "navigate-windows", kind, appPath, handles, url }),
+  );
+}
+
+/** Reloads the page in each window. */
+export async function reloadTrackedWindows(
+  kind: ScriptingKind,
+  appPath: string,
+  handles: readonly WindowHandle[],
+): Promise<ActOutcome> {
+  return acted(await script({ action: "reload-windows", kind, appPath, handles }));
+}
+
+export type ScreenRect = { x: number; y: number; width: number; height: number };
+
+/** The part of the main screen that windows may use. */
+export async function usableScreenArea(): Promise<ScreenRect | null> {
+  const reply = await script<ScreenRect>({ action: "screen-area" });
+  if (!reply.ok) return null;
+  return { x: reply.x, y: reply.y, width: reply.width, height: reply.height };
+}
+
+/** Moves and sizes windows. */
+export async function arrangeTrackedWindows(
+  kind: ScriptingKind,
+  appPath: string,
+  items: readonly { handle: WindowHandle; bounds: ScreenRect }[],
+): Promise<ActOutcome> {
+  return acted(await script({ action: "arrange-windows", kind, appPath, items }));
+}
+
+/**
+ * Quits a browser if it is still the run described by `run` and has no
+ * windows left. Resolves to whether it was quit.
+ */
+export async function quitBrowserIfEmpty(
+  kind: ScriptingKind,
+  appPath: string,
+  run: { pid: number; startedAt: number },
+): Promise<boolean> {
+  const reply = await script<{ quit: boolean }>({
+    action: "quit-if-empty",
+    kind,
+    appPath,
+    run,
+  });
+  return reply.ok && reply.quit;
+}
+
+/** The permissions that can be looked up without asking for them. */
+export async function checkPermissions(): Promise<{
+  screenRecording: boolean | null;
+  accessibility: boolean | null;
+}> {
+  const reply = await script<{
+    screenRecording: boolean | null;
+    accessibility: boolean | null;
+  }>({ action: "check-permissions" });
+  if (!reply.ok) return { screenRecording: null, accessibility: null };
+  return {
+    screenRecording: reply.screenRecording,
+    accessibility: reply.accessibility,
+  };
+}
+
+/**
+ * Whether the launcher may control one browser. The first time, macOS
+ * answers this by asking the person, and the check waits for their answer.
+ */
+export async function checkControl(
+  appPath: string,
+): Promise<"allowed" | "refused" | "not-running" | "unknown"> {
+  const reply = await script<{ running: boolean }>({
+    action: "check-control",
+    appPath,
+  });
+  if (reply.ok) return reply.running ? "allowed" : "not-running";
+  return reply.code === NOT_ALLOWED ? "refused" : "unknown";
+}
+
+/** Where each window is on the screen; null for one that is gone. */
+export async function boundsOfTrackedWindows(
+  kind: ScriptingKind,
+  appPath: string,
+  handles: readonly WindowHandle[],
+): Promise<(ScreenRect | null)[]> {
+  const reply = await script<{ bounds: (ScreenRect | null)[] }>({
+    action: "window-bounds",
+    kind,
+    appPath,
+    handles,
+  });
+  return reply.ok ? reply.bounds : handles.map(() => null);
 }

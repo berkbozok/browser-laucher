@@ -1,9 +1,26 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { BrowserGroups, type SavedGroup } from "@/components/browser-groups";
 import { BrowserIcon } from "@/components/browser-icon";
-import { OpenWindows, type LostBrowser } from "@/components/open-windows";
+import {
+  OpenWindows,
+  type LostBrowser,
+  type WindowActions,
+} from "@/components/open-windows";
+import { PictureDialog } from "@/components/picture-dialog";
+import { SetupCheck } from "@/components/setup-check";
+import { postJson, requestJson, toMessage } from "@/lib/client";
+import type { Layout } from "@/lib/layout";
+import {
+  summarizeAction,
+  summarizeClose,
+  summarizeOpen,
+  type Notice,
+} from "@/lib/summaries";
 import type {
+  ActionResponse,
+  ArrangeRequest,
   BrowserInfo,
   BrowsersResponse,
   CloseRequest,
@@ -11,17 +28,23 @@ import type {
   CloseResult,
   FocusRequest,
   FocusResponse,
+  NavigateRequest,
   OpenRequest,
   OpenResponse,
   OpenResult,
   OpenWindow,
+  SnapshotsResponse,
   Untracked,
+  WindowSelection,
   WindowsResponse,
 } from "@/lib/types";
 import { normalizeUrl } from "@/lib/url";
+import { nameList, plural } from "@/lib/words";
 
 /** How often the page asks what its windows are showing. */
 const WATCH_EVERY_MS = 4000;
+/** How many addresses are remembered for the URL field's suggestions. */
+const RECENT_MAX = 8;
 
 const STORAGE_KEY = "browser-launcher:v1";
 
@@ -29,7 +52,18 @@ type Prefs = {
   url: string;
   selected: string[];
   incognito: boolean;
+  /** Quit browsers the launcher had to start, when closing their windows. */
+  quitStarted: boolean;
+  /** Addresses opened lately, newest first. */
+  recent: string[];
+  groups: SavedGroup[];
 };
+
+type LaunchState =
+  | { status: "opening" }
+  | { status: "done"; result: OpenResult }
+  | { status: "closing" }
+  | { status: "closed"; result: CloseResult };
 
 /** Why a browser that was opened isn't in the list of open windows. */
 type LostNote = { reason: Untracked; detail?: string };
@@ -44,13 +78,10 @@ function explainLost(name: string, reason: Untracked): string {
   return `Opened in ${name}. It can't be shown or closed from here, so there is no live view; close it by hand.`;
 }
 
-type LaunchState =
-  | { status: "opening" }
-  | { status: "done"; result: OpenResult }
-  | { status: "closing" }
-  | { status: "closed"; result: CloseResult };
-
-type Notice = { text: string; allGood: boolean };
+const strings = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 
 function readPrefs(): Prefs | null {
   try {
@@ -58,13 +89,20 @@ function readPrefs(): Prefs | null {
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
-    const { url, selected, incognito } = parsed as Record<string, unknown>;
+    const saved = parsed as Record<string, unknown>;
+    const groups = Array.isArray(saved.groups) ? saved.groups : [];
     return {
-      url: typeof url === "string" ? url : "",
-      selected: Array.isArray(selected)
-        ? selected.filter((id): id is string => typeof id === "string")
-        : [],
-      incognito: incognito === true,
+      url: typeof saved.url === "string" ? saved.url : "",
+      selected: strings(saved.selected),
+      incognito: saved.incognito === true,
+      // On unless it was switched off.
+      quitStarted: saved.quitStarted !== false,
+      recent: strings(saved.recent).slice(0, RECENT_MAX),
+      groups: groups.flatMap((group: unknown): SavedGroup[] => {
+        if (typeof group !== "object" || group === null) return [];
+        const { name, ids } = group as Record<string, unknown>;
+        return typeof name === "string" ? [{ name, ids: strings(ids) }] : [];
+      }),
     };
   } catch {
     return null;
@@ -79,129 +117,8 @@ function writePrefs(prefs: Prefs): void {
   }
 }
 
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Something went wrong.";
-}
-
-async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch(input, { cache: "no-store", ...init });
-  } catch {
-    throw new Error("Can't reach the launcher server. Is it still running?");
-  }
-
-  const body: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message =
-      typeof body === "object" &&
-      body !== null &&
-      "error" in body &&
-      typeof body.error === "string"
-        ? body.error
-        : `The request failed (${response.status}).`;
-    throw new Error(message);
-  }
-  return body as T;
-}
-
-function plural(count: number, noun: string): string {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
-
-const nameList = new Intl.ListFormat("en", { type: "conjunction" });
-
-/** One line describing how the last launch went, across all browsers. */
-function summarizeOpen(results: OpenResult[]): Notice | null {
-  if (results.length === 0) return null;
-
-  const privateWindows = results.flatMap((r) => r.privateWindow ?? []);
-  const opened =
-    results.filter((r) => r.ok).length +
-    privateWindows.filter((p) => p.status === "opened").length;
-  const failed =
-    results.filter((r) => !r.ok).length +
-    privateWindows.filter((p) => p.status === "failed").length;
-  const namesWhere = (test: (result: OpenResult) => boolean) =>
-    results.filter(test).map((r) => r.name);
-
-  const parts: string[] = [];
-  if (privateWindows.length === 0) {
-    parts.push(
-      failed === 0
-        ? `Opened in ${plural(opened, "browser")}.`
-        : `Opened in ${opened} of ${plural(results.length, "browser")}. ${failed} failed.`,
-    );
-  } else {
-    parts.push(
-      failed === 0
-        ? `Opened ${plural(opened, "window")} in ${plural(results.length, "browser")}.`
-        : `Opened ${opened} of ${plural(opened + failed, "window")}. ${failed} failed.`,
-    );
-    const normalOnly = namesWhere(
-      (r) => r.privateWindow?.status === "unsupported",
-    );
-    if (normalOnly.length > 0) {
-      parts.push(
-        `${nameList.format(normalOnly)} can only open a normal window from here.`,
-      );
-    }
-  }
-
-  // Say why, for each window that didn't open.
-  for (const result of results) {
-    if (!result.ok && result.error) {
-      parts.push(`${result.name}: ${result.error}`);
-    }
-    if (result.privateWindow?.status === "failed") {
-      parts.push(`${result.name}: ${result.privateWindow.error}`);
-    }
-  }
-
-  // Windows that opened but that the Close button won't be able to reach.
-  const notAllowed = namesWhere((r) => r.untracked === "not-allowed");
-  if (notAllowed.length > 0) {
-    parts.push(
-      `macOS hasn't allowed the launcher to control ${nameList.format(notAllowed)}, so Close can't reach ${notAllowed.length === 1 ? "it" : "them"}. Allow it under System Settings → Privacy & Security → Automation.`,
-    );
-  }
-  const byHand = namesWhere(
-    (r) => r.untracked === "unsupported" || r.untracked === "unidentified",
-  );
-  if (byHand.length > 0) {
-    parts.push(
-      `${nameList.format(byHand)} can't be followed from here; see the note in the list below.`,
-    );
-  }
-
-  return {
-    text: parts.join(" "),
-    allGood: failed === 0 && notAllowed.length === 0,
-  };
-}
-
-function summarizeClose(results: CloseResult[]): Notice {
-  const closed = results.reduce((sum, r) => sum + r.closed, 0);
-  const gone = results.reduce((sum, r) => sum + r.alreadyGone, 0);
-  const failures = results.filter((r) => r.error);
-
-  const parts: string[] = [];
-  if (closed > 0) parts.push(`Closed ${plural(closed, "window")}.`);
-  if (gone > 0) {
-    parts.push(
-      closed > 0
-        ? `${gone} had already been closed.`
-        : gone === 1
-          ? "That window had already been closed."
-          : "Those windows had already been closed.",
-    );
-  }
-  for (const failure of failures) {
-    parts.push(`${failure.name}: ${failure.error}`);
-  }
-  if (parts.length === 0) parts.push("There was nothing to close.");
-  return { text: parts.join(" "), allGood: failures.length === 0 };
-}
+const without = <T,>(record: Record<string, T>, drop: (key: string) => boolean) =>
+  Object.fromEntries(Object.entries(record).filter(([key]) => !drop(key)));
 
 export function Launcher() {
   const [data, setData] = useState<BrowsersResponse | null>(null);
@@ -212,6 +129,10 @@ export function Launcher() {
   const [url, setUrl] = useState("");
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [incognito, setIncognito] = useState(false);
+  const [quitStarted, setQuitStarted] = useState(true);
+  const [recent, setRecent] = useState<string[]>([]);
+  const [groups, setGroups] = useState<SavedGroup[]>([]);
+
   const [launch, setLaunch] = useState<Record<string, LaunchState>>({});
   // The launcher's open windows, as the server last listed them. The server
   // keeps the list, so it survives a reload and a reply that went missing.
@@ -221,10 +142,16 @@ export function Launcher() {
   const [listTurn, setListTurn] = useState(0);
   // Browsers the last launch opened but can't follow, by browser id.
   const [lost, setLost] = useState<Record<string, LostNote>>({});
+  // The window shown large, by key.
+  const [enlarged, setEnlarged] = useState<string | null>(null);
+
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [opening, setOpening] = useState(false);
-  const [closing, setClosing] = useState(false);
+  // What is in progress, if anything. Opening and closing change the list
+  // of windows themselves; "working" covers everything else.
+  const [busy, setBusy] = useState<"opening" | "closing" | "working" | null>(
+    null,
+  );
 
   // Saved choices are applied once, on the first successful scan.
   const restored = useRef(false);
@@ -259,8 +186,12 @@ export function Launcher() {
               : installed,
           ),
         );
-        if (prefs?.url) setUrl((current) => current || prefs.url);
-        if (prefs?.incognito) setIncognito(true);
+        if (!prefs) return;
+        if (prefs.url) setUrl((current) => current || prefs.url);
+        setIncognito(prefs.incognito);
+        setQuitStarted(prefs.quitStarted);
+        setRecent(prefs.recent);
+        setGroups(prefs.groups);
       })
       .catch((error: unknown) => {
         if (!cancelled) setScanError(toMessage(error));
@@ -276,14 +207,22 @@ export function Launcher() {
 
   useEffect(() => {
     if (!data) return;
-    writePrefs({ url, selected: [...selected], incognito });
-  }, [data, url, selected, incognito]);
+    writePrefs({
+      url,
+      selected: [...selected],
+      incognito,
+      quitStarted,
+      recent,
+      groups,
+    });
+  }, [data, url, selected, incognito, quitStarted, recent, groups]);
 
   // Keep the list of open windows current: what each shows, and which are
   // gone (closed by hand, browser quit). Paused while an Open or Close is
   // running, which changes the list itself.
+  const listChanging = busy === "opening" || busy === "closing";
   useEffect(() => {
-    if (opening || closing) return;
+    if (listChanging) return;
 
     let cancelled = false;
     const look = async () => {
@@ -304,7 +243,7 @@ export function Launcher() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [listTurn, opening, closing]);
+  }, [listTurn, listChanging]);
 
   const installed = data?.browsers.filter((browser) => browser.installed) ?? [];
   const missing = data?.browsers.filter((browser) => !browser.installed) ?? [];
@@ -313,12 +252,18 @@ export function Launcher() {
   const windowCount =
     chosen.length +
     (incognito ? chosen.filter((browser) => browser.supportsPrivate).length : 0);
-  // Close only ever touches the browsers that are ticked right now.
+
+  // Everything done to "the open windows" only touches the browsers that are
+  // ticked right now.
   const openIn = (id: string) => windows.filter((w) => w.browser === id).length;
-  const closable = chosen
+  const ticked = chosen
     .filter((browser) => openIn(browser.id) > 0)
     .map((browser) => browser.id);
-  const closableCount = closable.reduce((sum, id) => sum + openIn(id), 0);
+  const tickedCount = ticked.reduce((sum, id) => sum + openIn(id), 0);
+
+  const needSetup = chosen
+    .filter((browser) => browser.needsAccessibility)
+    .map((browser) => browser.name);
   const lostBrowsers: LostBrowser[] = installed.flatMap((browser) => {
     const note = lost[browser.id];
     return note
@@ -331,9 +276,10 @@ export function Launcher() {
         ]
       : [];
   });
-  const needSetup = chosen
-    .filter((browser) => browser.needsAccessibility)
-    .map((browser) => browser.name);
+  const enlargedWindow = windows.find((w) => w.key === enlarged) ?? null;
+  const enlargedBrowser = installed.find(
+    (browser) => browser.id === enlargedWindow?.browser,
+  );
 
   function rescan() {
     setScanning(true);
@@ -348,20 +294,48 @@ export function Launcher() {
     });
   }
 
-  async function openAll() {
+  /** The address in the field as a full URL, or null after saying why not. */
+  function readAddress(): string | null {
     const target = normalizeUrl(url);
     if (!target) {
       setFormError(
         "That doesn't look like a web address. Try something like example.com.",
       );
-      return;
+      return null;
     }
+    setUrl(target);
+    setRecent((current) =>
+      [target, ...current.filter((item) => item !== target)].slice(
+        0,
+        RECENT_MAX,
+      ),
+    );
+    return target;
+  }
+
+  /** Runs one thing at a time and shows how it went. */
+  async function run(work: () => Promise<Notice | null>) {
+    setFormError(null);
+    setNotice(null);
+    setBusy("working");
+    try {
+      setNotice(await work());
+    } catch (error) {
+      setFormError(toMessage(error));
+    } finally {
+      setBusy(null);
+      setListTurn((turn) => turn + 1);
+    }
+  }
+
+  async function openAll() {
+    const target = readAddress();
+    if (!target) return;
 
     const ids = chosen.map((browser) => browser.id);
     setFormError(null);
     setNotice(null);
-    setUrl(target);
-    setOpening(true);
+    setBusy("opening");
     setLaunch(Object.fromEntries(ids.map((id) => [id, { status: "opening" }])));
 
     const request: OpenRequest = {
@@ -370,11 +344,7 @@ export function Launcher() {
       includePrivate: incognito,
     };
     try {
-      const { results } = await requestJson<OpenResponse>("/api/open", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      });
+      const { results } = await postJson<OpenResponse>("/api/open", request);
       setLaunch(
         Object.fromEntries(
           results.map((result): [string, LaunchState] => [
@@ -398,56 +368,32 @@ export function Launcher() {
         }
         return next;
       });
-      setListTurn((turn) => turn + 1);
       setNotice(summarizeOpen(results));
     } catch (error) {
       setLaunch({});
       setFormError(toMessage(error));
     } finally {
-      setOpening(false);
-    }
-  }
-
-  async function showWindow(target: OpenWindow) {
-    const request: FocusRequest = { key: target.key };
-    setFormError(null);
-    try {
-      const { gone } = await requestJson<FocusResponse>("/api/focus", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      });
-      if (!gone) return;
-      setWindows((current) => current.filter((w) => w.key !== target.key));
-      setNotice({ text: "That window had already been closed.", allGood: false });
-    } catch (error) {
-      setFormError(toMessage(error));
+      setBusy(null);
+      setListTurn((turn) => turn + 1);
     }
   }
 
   async function closeAll() {
-    if (closable.length === 0) return;
-    const request: CloseRequest = { browsers: closable };
+    if (ticked.length === 0) return;
+    const request: CloseRequest = { browsers: ticked, quitStarted };
 
     setFormError(null);
     setNotice(null);
-    setClosing(true);
+    setBusy("closing");
     setLaunch((current) => ({
       ...current,
       ...Object.fromEntries(
-        closable.map((id): [string, LaunchState] => [
-          id,
-          { status: "closing" },
-        ]),
+        ticked.map((id): [string, LaunchState] => [id, { status: "closing" }]),
       ),
     }));
 
     try {
-      const { results } = await requestJson<CloseResponse>("/api/close", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      });
+      const { results } = await postJson<CloseResponse>("/api/close", request);
       setLaunch((current) => ({
         ...current,
         ...Object.fromEntries(
@@ -462,12 +408,7 @@ export function Launcher() {
         results.filter((result) => !result.error).map((result) => result.id),
       );
       setWindows((current) => current.filter((w) => !closedIn.has(w.browser)));
-      setLost((current) =>
-        Object.fromEntries(
-          Object.entries(current).filter(([id]) => !closable.includes(id)),
-        ),
-      );
-      setListTurn((turn) => turn + 1);
+      setLost((current) => without(current, (id) => ticked.includes(id)));
       setNotice(summarizeClose(results));
     } catch (error) {
       setLaunch((current) =>
@@ -479,9 +420,99 @@ export function Launcher() {
       );
       setFormError(toMessage(error));
     } finally {
-      setClosing(false);
+      setBusy(null);
+      setListTurn((turn) => turn + 1);
     }
   }
+
+  // --- things done to the open windows of the ticked browsers ---
+
+  function goTo() {
+    const target = readAddress();
+    if (!target) return;
+    const request: NavigateRequest = { browsers: ticked, url: target };
+    void run(async () => {
+      const { results } = await postJson<ActionResponse>("/api/navigate", request);
+      return summarizeAction(
+        (count) => `Sent ${plural(count, "window")} to ${target}.`,
+        results,
+      );
+    });
+  }
+
+  function reload(selection: WindowSelection) {
+    void run(async () => {
+      const { results } = await postJson<ActionResponse>("/api/reload", selection);
+      return summarizeAction(
+        (count) => `Reloaded ${plural(count, "window")}.`,
+        results,
+      );
+    });
+  }
+
+  function arrangeAll(layout: Layout) {
+    const request: ArrangeRequest = { browsers: ticked, layout };
+    void run(async () => {
+      const { results } = await postJson<ActionResponse>("/api/arrange", request);
+      return summarizeAction(
+        (count) => `Arranged ${plural(count, "window")}.`,
+        results,
+      );
+    });
+  }
+
+  function savePictures() {
+    const selection: WindowSelection = { browsers: ticked };
+    void run(async () => {
+      const result = await postJson<SnapshotsResponse>("/api/snapshots", selection);
+      if (result.error) throw new Error(result.error);
+      if (!result.folder) {
+        return { text: "There were no windows to take pictures of.", allGood: false };
+      }
+      const missed =
+        result.missed.length > 0
+          ? ` No picture could be taken of ${result.missed.join(", ")}.`
+          : "";
+      return {
+        text: `Saved ${plural(result.saved, "picture")} to ${result.folder.replace(/^\/Users\/[^/]+/, "~")}.${missed}`,
+        allGood: result.missed.length === 0,
+      };
+    });
+  }
+
+  // --- things done to one window ---
+
+  async function showWindow(target: OpenWindow) {
+    const request: FocusRequest = { key: target.key };
+    setFormError(null);
+    try {
+      const { gone } = await postJson<FocusResponse>("/api/focus", request);
+      if (!gone) return;
+      setWindows((current) => current.filter((w) => w.key !== target.key));
+      setNotice({ text: "That window had already been closed.", allGood: false });
+    } catch (error) {
+      setFormError(toMessage(error));
+    }
+  }
+
+  function closeWindow(target: OpenWindow) {
+    const request: CloseRequest = { keys: [target.key], quitStarted };
+    setEnlarged((current) => (current === target.key ? null : current));
+    void run(async () => {
+      const { results } = await postJson<CloseResponse>("/api/close", request);
+      if (!results.some((result) => result.error)) {
+        setWindows((current) => current.filter((w) => w.key !== target.key));
+      }
+      return summarizeClose(results);
+    });
+  }
+
+  const windowActions: WindowActions = {
+    onShow: (target) => void showWindow(target),
+    onEnlarge: (target) => setEnlarged(target.key),
+    onReload: (target) => reload({ keys: [target.key] }),
+    onClose: closeWindow,
+  };
 
   return (
     <div className="flex flex-col gap-8">
@@ -507,6 +538,7 @@ export function Launcher() {
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
+            list="recent-addresses"
             placeholder="example.com or localhost:3000"
             value={url}
             onChange={(event) => {
@@ -517,14 +549,20 @@ export function Launcher() {
             }}
             aria-invalid={formError ? true : undefined}
             aria-describedby="form-status"
-            className="h-11 min-w-0 rounded-lg border sm:flex-1 border-zinc-300 bg-white px-3 font-mono text-sm outline-none transition placeholder:text-zinc-400 focus:border-blue-500 focus:ring-3 focus:ring-blue-500/25 dark:border-zinc-700 dark:bg-zinc-900 dark:placeholder:text-zinc-600"
+            className="h-11 min-w-0 rounded-lg border border-zinc-300 bg-white px-3 font-mono text-sm outline-none transition placeholder:text-zinc-400 focus:border-blue-500 focus:ring-3 focus:ring-blue-500/25 sm:flex-1 dark:border-zinc-700 dark:bg-zinc-900 dark:placeholder:text-zinc-600"
           />
+          {/* Addresses used lately, offered as you type. */}
+          <datalist id="recent-addresses">
+            {recent.map((address) => (
+              <option key={address} value={address} />
+            ))}
+          </datalist>
           <button
             type="submit"
-            disabled={opening || closing || chosen.length === 0}
+            disabled={busy !== null || chosen.length === 0}
             className="h-11 shrink-0 rounded-lg bg-blue-600 px-5 text-sm font-medium text-white outline-none transition hover:bg-blue-500 focus-visible:ring-3 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500"
           >
-            {opening
+            {busy === "opening"
               ? "Opening…"
               : chosen.length === 0
                 ? "Select a browser"
@@ -535,37 +573,35 @@ export function Launcher() {
           <button
             type="button"
             onClick={() => void closeAll()}
-            disabled={opening || closing || closableCount === 0}
+            disabled={busy !== null || tickedCount === 0}
             title="Closes the windows the launcher opened in the ticked browsers"
             className="h-11 shrink-0 rounded-lg border border-zinc-300 bg-white px-5 text-sm font-medium outline-none transition hover:bg-zinc-100 focus-visible:ring-3 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:text-zinc-400 disabled:hover:bg-white dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800 dark:disabled:text-zinc-600 dark:disabled:hover:bg-zinc-900"
           >
-            {closing
+            {busy === "closing"
               ? "Closing…"
-              : closableCount === 0
+              : tickedCount === 0
                 ? "Close windows"
-                : `Close ${plural(closableCount, "window")}`}
+                : `Close ${plural(tickedCount, "window")}`}
           </button>
         </div>
-        <label className="mt-1 flex w-fit cursor-pointer items-center gap-3 select-none">
-          <input
-            type="checkbox"
-            role="switch"
-            className="peer sr-only"
-            checked={incognito}
-            onChange={(event) => setIncognito(event.target.checked)}
-          />
-          <span
-            aria-hidden="true"
-            className="relative h-6 w-10 shrink-0 rounded-full bg-zinc-300 transition peer-checked:bg-blue-600 peer-focus-visible:ring-3 peer-focus-visible:ring-blue-500/40 after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-4 dark:bg-zinc-700"
-          />
-          <span className="text-sm">
+
+        <div className="mt-1 flex flex-wrap gap-x-8 gap-y-2">
+          <Switch checked={incognito} onChange={setIncognito}>
             <span className="font-medium">Also open in incognito</span>
             <span className="text-zinc-500 dark:text-zinc-400">
               {" "}
               — a second, private window in each browser
             </span>
-          </span>
-        </label>
+          </Switch>
+          <Switch checked={quitStarted} onChange={setQuitStarted}>
+            <span className="font-medium">Quit what I started</span>
+            <span className="text-zinc-500 dark:text-zinc-400">
+              {" "}
+              — on Close, quit browsers that weren&apos;t open before
+            </span>
+          </Switch>
+        </div>
+
         <p id="form-status" aria-live="polite" className="min-h-5 text-sm">
           {formError ? (
             <span className="text-red-600 dark:text-red-400">{formError}</span>
@@ -579,6 +615,8 @@ export function Launcher() {
             >
               {notice.text}
             </span>
+          ) : busy === "working" ? (
+            <span className="text-zinc-500 dark:text-zinc-400">Working…</span>
           ) : null}
         </p>
       </form>
@@ -588,13 +626,15 @@ export function Launcher() {
         windows={windows}
         lost={lostBrowsers}
         mayCapture={mayCapture}
-        onShow={(target) => void showWindow(target)}
+        tickedCount={tickedCount}
+        busy={busy !== null}
+        actions={windowActions}
+        onGoTo={goTo}
+        onReloadAll={() => reload({ browsers: ticked })}
+        onArrange={arrangeAll}
+        onSavePictures={savePictures}
         onDismissLost={(id) =>
-          setLost((current) =>
-            Object.fromEntries(
-              Object.entries(current).filter(([key]) => key !== id),
-            ),
-          )
+          setLost((current) => without(current, (key) => key === id))
         }
       />
 
@@ -628,6 +668,26 @@ export function Launcher() {
             </ToolbarButton>
           </div>
         </div>
+
+        {installed.length > 1 ? (
+          <BrowserGroups
+            installed={installed}
+            selected={selected}
+            groups={groups}
+            onPick={(ids) => setSelected(new Set(ids))}
+            onSave={(name) =>
+              setGroups((current) => [
+                ...current.filter((group) => group.name !== name),
+                { name, ids: [...selected] },
+              ])
+            }
+            onDelete={(name) =>
+              setGroups((current) =>
+                current.filter((group) => group.name !== name),
+              )
+            }
+          />
+        ) : null}
 
         {scanError ? (
           <p
@@ -707,7 +767,49 @@ export function Launcher() {
           </p>
         ) : null}
       </section>
+
+      {data?.supported ? <SetupCheck /> : null}
+
+      {enlargedWindow && enlargedBrowser ? (
+        <PictureDialog
+          key={enlargedWindow.key}
+          browser={enlargedBrowser}
+          target={enlargedWindow}
+          live={mayCapture !== false}
+          onDismiss={() => setEnlarged(null)}
+          onShow={() => void showWindow(enlargedWindow)}
+          onReload={() => reload({ keys: [enlargedWindow.key] })}
+          onClose={() => closeWindow(enlargedWindow)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function Switch({
+  checked,
+  onChange,
+  children,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="flex w-fit cursor-pointer items-center gap-3 select-none">
+      <input
+        type="checkbox"
+        role="switch"
+        className="peer sr-only"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span
+        aria-hidden="true"
+        className="relative h-6 w-10 shrink-0 rounded-full bg-zinc-300 transition peer-checked:bg-blue-600 peer-focus-visible:ring-3 peer-focus-visible:ring-blue-500/40 after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-4 dark:bg-zinc-700"
+      />
+      <span className="text-sm">{children}</span>
+    </label>
   );
 }
 

@@ -1,4 +1,5 @@
 import { rejectUnlessLocal } from "./local-request";
+import type { WindowSelection } from "./types";
 
 export function badRequest(error: string, status = 400): Response {
   return Response.json({ error }, { status });
@@ -33,4 +34,40 @@ export async function readOwnJson(
   const isObject =
     typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
   return { payload: isObject ? (parsed as Record<string, unknown>) : {} };
+}
+
+const MAX_NAMED = 500;
+
+function isShortStrings(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= MAX_NAMED &&
+    value.every((item) => typeof item === "string" && item.length <= 200)
+  );
+}
+
+/**
+ * Reads which windows a request is about: `browsers` (every launcher window
+ * in those browsers) or `keys` (individual windows). Null if neither is
+ * given properly.
+ */
+export function readSelection(
+  payload: Record<string, unknown>,
+): WindowSelection | null {
+  if (isShortStrings(payload.keys)) return { keys: payload.keys };
+  if (isShortStrings(payload.browsers)) return { browsers: payload.browsers };
+  return null;
+}
+
+/** Runs the work of a route and turns a thrown error into a reply. */
+export async function replyWith<T>(work: () => Promise<T>): Promise<Response> {
+  try {
+    return Response.json(await work());
+  } catch (error) {
+    return badRequest(
+      error instanceof Error ? error.message : "That didn't work.",
+      502,
+    );
+  }
 }

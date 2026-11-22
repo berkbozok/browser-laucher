@@ -1,9 +1,11 @@
 "use client";
 
-import Image from "next/image";
-import { useEffect, useState } from "react";
 import { BrowserIcon } from "@/components/browser-icon";
+import { LivePicture } from "@/components/live-picture";
+import type { Layout } from "@/lib/layout";
 import type { BrowserInfo, OpenWindow } from "@/lib/types";
+import { rowsFor, shortAddress } from "@/lib/window-rows";
+import { plural } from "@/lib/words";
 
 /** A browser that was opened but whose windows the launcher can't follow. */
 export type LostBrowser = {
@@ -14,46 +16,21 @@ export type LostBrowser = {
   detail?: string;
 };
 
-/** One line of the list: a browser and the pair of windows from one launch. */
-type Row = {
-  key: string;
-  launch: number;
-  normal: OpenWindow | null;
-  incognito: OpenWindow | null;
+/** Things that can be done to a single window from its box. */
+export type WindowActions = {
+  onShow: (target: OpenWindow) => void;
+  onEnlarge: (target: OpenWindow) => void;
+  onReload: (target: OpenWindow) => void;
+  onClose: (target: OpenWindow) => void;
 };
 
-/**
- * Pairs each normal window with the incognito window opened by the same
- * press of Open, newest launch first.
- */
-function rowsFor(browser: string, windows: OpenWindow[]): Row[] {
-  const launches = [...new Set(windows.map((w) => w.launch))].sort(
-    (a, b) => b - a,
-  );
-  return launches.flatMap((launch) => {
-    const mine = windows.filter((w) => w.launch === launch);
-    const normal = mine.filter((w) => !w.private);
-    const incognito = mine.filter((w) => w.private);
-    const count = Math.max(normal.length, incognito.length);
-    return Array.from({ length: count }, (_, i) => ({
-      key: `${browser}/${launch}/${i}`,
-      launch,
-      normal: normal[i] ?? null,
-      incognito: incognito[i] ?? null,
-    }));
-  });
-}
-
-/** "example.com/path" from a full address: enough to recognise the page. */
-function shortAddress(url: string): string {
-  try {
-    const { host, pathname, search } = new URL(url);
-    const path = pathname === "/" ? "" : pathname;
-    return `${host}${path}${search}`;
-  } catch {
-    return url;
-  }
-}
+/** The sizes offered next to "fill the screen". Heights are cut to fit. */
+const SIZES: { label: string; layout: Layout }[] = [
+  { label: "Narrow · 500 wide", layout: { width: 500, height: 900 } },
+  { label: "Tablet · 820 wide", layout: { width: 820, height: 1100 } },
+  { label: "Laptop · 1280 wide", layout: { width: 1280, height: 800 } },
+  { label: "Desktop · 1440 wide", layout: { width: 1440, height: 900 } },
+];
 
 const timeOfDay = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
@@ -62,12 +39,21 @@ const timeOfDay = new Intl.DateTimeFormat(undefined, {
 
 const COLUMNS = "sm:grid-cols-[8.5rem_minmax(0,1fr)_minmax(0,1fr)]";
 
+const toolButton =
+  "rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium outline-none transition hover:bg-zinc-100 focus-visible:ring-3 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:text-zinc-400 disabled:hover:bg-transparent dark:border-zinc-700 dark:hover:bg-zinc-800 dark:disabled:text-zinc-600";
+
 export function OpenWindows({
   browsers,
   windows,
   lost,
   mayCapture,
-  onShow,
+  tickedCount,
+  busy,
+  actions,
+  onGoTo,
+  onReloadAll,
+  onArrange,
+  onSavePictures,
   onDismissLost,
 }: {
   /** Installed browsers, in the order they are listed on the page. */
@@ -78,7 +64,15 @@ export function OpenWindows({
   lost: LostBrowser[];
   /** Whether macOS lets the launcher take pictures of windows. */
   mayCapture: boolean | null;
-  onShow: (target: OpenWindow) => void;
+  /** How many of the windows are in browsers that are ticked right now. */
+  tickedCount: number;
+  /** True while something is in progress, so the buttons wait. */
+  busy: boolean;
+  actions: WindowActions;
+  onGoTo: () => void;
+  onReloadAll: () => void;
+  onArrange: (layout: Layout) => void;
+  onSavePictures: () => void;
   onDismissLost: (browserId: string) => void;
 }) {
   const lines = browsers.flatMap((browser) =>
@@ -98,15 +92,77 @@ export function OpenWindows({
   // so the total work stays about the same.
   const pictures = windows.filter((w) => w.hasPreview).length;
   const refreshEvery = Math.min(6000, Math.max(1500, pictures * 250));
+  const idle = busy || tickedCount === 0;
 
   return (
     <section aria-labelledby="windows-heading" className="flex flex-col gap-3">
-      <h2 id="windows-heading" className="text-sm font-medium">
-        Open windows
-        <span className="ml-2 font-normal text-zinc-500 dark:text-zinc-400">
-          {windows.length} · live · click one to bring it to the front
-        </span>
-      </h2>
+      <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-2">
+        <h2 id="windows-heading" className="text-sm font-medium">
+          Open windows
+          <span className="ml-2 font-normal text-zinc-500 dark:text-zinc-400">
+            {windows.length} · live · click one to bring it to the front
+          </span>
+        </h2>
+
+        {windows.length > 0 ? (
+          <div
+            role="group"
+            aria-label="Actions for the windows in ticked browsers"
+            className="flex flex-wrap items-center gap-2"
+          >
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              {tickedCount === 0
+                ? "Tick a browser to act on its windows"
+                : `${plural(tickedCount, "window")} in ticked browsers:`}
+            </span>
+            <button
+              type="button"
+              className={toolButton}
+              disabled={idle}
+              onClick={onGoTo}
+              title="Send these windows to the address in the URL field"
+            >
+              Go to address
+            </button>
+            <button
+              type="button"
+              className={toolButton}
+              disabled={idle}
+              onClick={onReloadAll}
+            >
+              Reload
+            </button>
+            <select
+              aria-label="Arrange these windows"
+              className={`${toolButton} bg-transparent`}
+              disabled={idle}
+              value=""
+              onChange={(event) => {
+                const choice = event.target.value;
+                if (choice === "tile") onArrange("tile");
+                else if (choice !== "") onArrange(SIZES[Number(choice)].layout);
+              }}
+            >
+              <option value="">Arrange…</option>
+              <option value="tile">Tile to fill the screen</option>
+              {SIZES.map((size, index) => (
+                <option key={size.label} value={index}>
+                  {size.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className={toolButton}
+              disabled={idle}
+              onClick={onSavePictures}
+              title="Save a picture of each of these windows into a folder"
+            >
+              Save pictures
+            </button>
+          </div>
+        ) : null}
+      </div>
 
       {mayCapture === false && windows.length > 0 ? (
         <p
@@ -148,7 +204,7 @@ export function OpenWindows({
               target={row.normal}
               live={mayCapture !== false}
               refreshEvery={refreshEvery}
-              onShow={onShow}
+              actions={actions}
             />
             <WindowBox
               kind="Incognito"
@@ -156,7 +212,7 @@ export function OpenWindows({
               target={row.incognito}
               live={mayCapture !== false}
               refreshEvery={refreshEvery}
-              onShow={onShow}
+              actions={actions}
             />
           </li>
         ))}
@@ -216,7 +272,7 @@ function WindowBox({
   target,
   live,
   refreshEvery,
-  onShow,
+  actions,
 }: {
   kind: "Normal" | "Incognito";
   browser: BrowserInfo;
@@ -224,7 +280,7 @@ function WindowBox({
   /** Whether to ask for pictures at all. */
   live: boolean;
   refreshEvery: number;
-  onShow: (target: OpenWindow) => void;
+  actions: WindowActions;
 }) {
   if (!target) {
     return (
@@ -239,140 +295,105 @@ function WindowBox({
   // Until the browser has told us, the address is the best name there is.
   const title = target.title?.trim() || address || "Untitled";
   const incognito = kind === "Incognito";
+  const what = `${browser.name}'s ${kind.toLowerCase()} window`;
 
   return (
-    <button
-      type="button"
-      onClick={() => onShow(target)}
-      title={`Show ${browser.name}'s ${kind.toLowerCase()} window`}
-      className={`group flex min-w-0 flex-col overflow-hidden rounded-xl border text-left outline-none transition focus-visible:ring-3 focus-visible:ring-blue-500/40 ${
+    <div
+      className={`group relative flex min-w-0 flex-col overflow-hidden rounded-xl border transition focus-within:ring-3 focus-within:ring-blue-500/30 ${
         incognito
           ? "border-zinc-800 bg-zinc-900 text-zinc-100 hover:border-zinc-500 dark:border-zinc-700 dark:bg-black dark:hover:border-zinc-400"
           : "border-zinc-200 bg-white text-zinc-900 hover:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:border-zinc-400"
       }`}
     >
-      {live && target.hasPreview ? (
-        <LivePicture
-          windowKey={target.key}
-          every={refreshEvery}
-          label={`${browser.name}, ${kind.toLowerCase()} window`}
-        />
-      ) : null}
-      <span className="flex min-w-0 flex-col gap-0.5 px-3 py-2">
-        <span className="flex items-center gap-2">
-          <span
-            className={`shrink-0 rounded px-1.5 py-px text-[0.625rem] font-semibold tracking-wide uppercase sm:hidden ${
-              incognito
-                ? "bg-zinc-700 text-zinc-200"
-                : "bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200"
-            }`}
-          >
-            {kind}
-          </span>
-          <span className="min-w-0 flex-1 truncate text-sm font-medium">
-            {title}
-          </span>
-          <svg
-            aria-hidden="true"
-            viewBox="0 0 16 16"
-            fill="none"
-            className="size-3.5 shrink-0 opacity-40 transition group-hover:opacity-100"
-          >
-            <path
-              d="M6 3h7v7M13 3 4 12"
-              stroke="currentColor"
-              strokeWidth="1.75"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </span>
-        {address && address !== title ? (
-          <span
-            className={`truncate font-mono text-xs ${
-              incognito ? "text-zinc-400" : "text-zinc-500 dark:text-zinc-400"
-            }`}
-          >
-            {address}
-          </span>
+      {/* The whole box brings the window forward... */}
+      <button
+        type="button"
+        onClick={() => actions.onShow(target)}
+        title={`Show ${what}`}
+        className="flex min-w-0 flex-col text-left outline-none"
+      >
+        {live && target.hasPreview ? (
+          <LivePicture
+            windowKey={target.key}
+            every={refreshEvery}
+            label={what}
+            className="aspect-[16/10] w-full border-b border-inherit"
+          />
         ) : null}
+        <span className="flex min-w-0 flex-col gap-0.5 px-3 py-2">
+          <span className="flex items-center gap-2">
+            <span
+              className={`shrink-0 rounded px-1.5 py-px text-[0.625rem] font-semibold tracking-wide uppercase sm:hidden ${
+                incognito
+                  ? "bg-zinc-700 text-zinc-200"
+                  : "bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200"
+              }`}
+            >
+              {kind}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-sm font-medium">
+              {title}
+            </span>
+          </span>
+          {address && address !== title ? (
+            <span
+              className={`truncate font-mono text-xs ${
+                incognito
+                  ? "text-zinc-400"
+                  : "text-zinc-500 dark:text-zinc-400"
+              }`}
+            >
+              {address}
+            </span>
+          ) : null}
+        </span>
+      </button>
+
+      {/* ...and these sit on top of it for the rest. */}
+      <span className="absolute top-1.5 right-1.5 flex gap-1 opacity-100 transition sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100">
+        <IconButton label={`Enlarge ${what}`} onClick={() => actions.onEnlarge(target)}>
+          <path d="M3 6V3h3M10 3h3v3M13 10v3h-3M6 13H3v-3" />
+        </IconButton>
+        <IconButton label={`Reload ${what}`} onClick={() => actions.onReload(target)}>
+          <path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v2.5h-2.5" />
+        </IconButton>
+        <IconButton label={`Close ${what}`} onClick={() => actions.onClose(target)}>
+          <path d="M4 4l8 8M12 4l-8 8" />
+        </IconButton>
       </span>
-    </button>
+    </div>
   );
 }
 
-/**
- * A picture of one window that keeps itself up to date. Each new picture is
- * fetched in full before it replaces the old one, so the box never blinks.
- */
-function LivePicture({
-  windowKey,
-  every,
+function IconButton({
   label,
+  onClick,
+  children,
 }: {
-  windowKey: string;
-  every: number;
   label: string;
+  onClick: () => void;
+  children: React.ReactNode;
 }) {
-  const [picture, setPicture] = useState<string | null>(null);
-
-  useEffect(() => {
-    let stopped = false;
-    let timer: number | undefined;
-    let current: string | null = null;
-
-    const refresh = async () => {
-      // Nobody is looking at a hidden tab, so don't take pictures for it.
-      if (document.visibilityState === "visible") {
-        try {
-          const response = await fetch(
-            `/api/preview/${encodeURIComponent(windowKey)}`,
-            { cache: "no-store" },
-          );
-          if (response.ok) {
-            const next = URL.createObjectURL(await response.blob());
-            if (stopped) {
-              URL.revokeObjectURL(next);
-              return;
-            }
-            const previous = current;
-            current = next;
-            setPicture(next);
-            if (previous) URL.revokeObjectURL(previous);
-          }
-          // Otherwise keep showing the last picture we got: the window may
-          // just be minimised.
-        } catch {
-          // The server didn't answer; the next round will try again.
-        }
-      }
-      if (!stopped) timer = window.setTimeout(() => void refresh(), every);
-    };
-
-    void refresh();
-    return () => {
-      stopped = true;
-      window.clearTimeout(timer);
-      if (current) URL.revokeObjectURL(current);
-    };
-  }, [windowKey, every]);
-
   return (
-    <span className="relative block aspect-[16/10] w-full overflow-hidden border-b border-inherit bg-zinc-100 dark:bg-zinc-950">
-      {picture ? (
-        <Image
-          src={picture}
-          alt={label}
-          fill
-          unoptimized
-          sizes="(min-width: 640px) 40vw, 50vw"
-          className="object-cover object-top"
-        />
-      ) : (
-        <span className="absolute inset-0 flex items-center justify-center text-xs text-zinc-400 dark:text-zinc-600">
-          Waiting for a picture…
-        </span>
-      )}
-    </span>
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      className="flex size-7 items-center justify-center rounded-md bg-black/65 text-white outline-none backdrop-blur-sm transition hover:bg-black/85 focus-visible:ring-3 focus-visible:ring-blue-400/70"
+    >
+      <svg
+        aria-hidden="true"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="size-3.5"
+      >
+        {children}
+      </svg>
+    </button>
   );
 }

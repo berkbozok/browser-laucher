@@ -4,11 +4,13 @@ export type BrowserInfo = {
   id: string;
   name: string;
   installed: boolean;
+  /** Which family it belongs to, for picking a group of browsers at once. */
+  engine: "chromium" | "firefox" | "webkit";
   /** Whether this browser can be told to open a private (incognito) window. */
   supportsPrivate: boolean;
   /**
    * True when that private window only works after the person has switched
-   * on the macOS Accessibility permission. Safari is the one such browser.
+   * on the macOS Accessibility permission (Safari and Orion).
    */
   needsAccessibility: boolean;
 };
@@ -116,9 +118,22 @@ export type WindowsResponse = {
   mayCapture: boolean | null;
 };
 
-/** Close the launcher's windows in these browsers. */
-export type CloseRequest = {
-  browsers: string[];
+/**
+ * Which of the launcher's windows to act on: every one in the named
+ * browsers, or the individual windows named by key. One of the two.
+ */
+export type WindowSelection = {
+  browsers?: string[];
+  keys?: string[];
+};
+
+/** Close the selected windows. */
+export type CloseRequest = WindowSelection & {
+  /**
+   * Also quit a browser that the launcher itself had started, once it has
+   * no windows left.
+   */
+  quitStarted?: boolean;
 };
 
 export type CloseResult = {
@@ -127,7 +142,55 @@ export type CloseResult = {
   closed: number;
   /** Windows that had already been closed by hand. */
   alreadyGone: number;
+  /** True when the browser was quit as well. */
+  quit?: boolean;
   error?: string;
+};
+
+/** How one browser's windows took an instruction (reload, go to, arrange). */
+export type ActionResult = {
+  id: string;
+  name: string;
+  /** Windows that did it. */
+  done: number;
+  /** Windows that had already been closed. */
+  gone: number;
+  error?: string;
+};
+
+export type ActionResponse = {
+  results: ActionResult[];
+};
+
+/** Send the selected windows to a new address. */
+export type NavigateRequest = WindowSelection & { url: string };
+
+/** Lay the selected windows out on the screen. */
+export type ArrangeRequest = WindowSelection & {
+  /** Fill the screen, or give every window this size. */
+  layout: "tile" | { width: number; height: number };
+};
+
+export type SnapshotsResponse = {
+  /** Where the pictures were saved, or null if none could be. */
+  folder: string | null;
+  saved: number;
+  /** Windows a picture couldn't be taken of, by description. */
+  missed: string[];
+  error?: string;
+};
+
+export type SetupResponse = {
+  /** Screen Recording: live pictures and saved pictures. Null if unknown. */
+  screenRecording: boolean | null;
+  /** Accessibility: Safari's incognito window, Firefox reload. */
+  accessibility: boolean | null;
+  browsers: {
+    id: string;
+    name: string;
+    /** Whether the launcher may control this browser. */
+    control: "allowed" | "refused" | "not-running" | "unknown";
+  }[];
 };
 
 export type CloseResponse = {

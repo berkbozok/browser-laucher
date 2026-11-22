@@ -34,19 +34,19 @@ async function capture(screenId: number): Promise<Buffer | null> {
     path.join(/* turbopackIgnore: true */ tmpdir(), "browser-launcher-shot-"),
   );
   try {
-    const file = path.join(/* turbopackIgnore: true */ folder, "window.jpg");
+    // PNG rather than JPEG: it keeps the window's rounded corners see-through
+    // instead of filling them with white.
+    const file = path.join(/* turbopackIgnore: true */ folder, "window.png");
     // -l: this one window, wherever it sits and whatever covers it.
     // -o: without its shadow.  -x: without the camera sound.
     await run(
       "/usr/sbin/screencapture",
-      ["-x", "-o", `-l${screenId}`, "-t", "jpg", file],
+      ["-x", "-o", `-l${screenId}`, "-t", "png", file],
       { timeout: 5000 },
     );
-    await run(
-      "/usr/bin/sips",
-      ["-Z", String(MAX_SIDE), "-s", "formatOptions", "70", file],
-      { timeout: 5000 },
-    );
+    await run("/usr/bin/sips", ["-Z", String(MAX_SIDE), file], {
+      timeout: 5000,
+    });
     return await readFile(file);
   } catch {
     // The window is gone or minimised, or macOS hasn't allowed pictures.
@@ -59,7 +59,7 @@ async function capture(screenId: number): Promise<Buffer | null> {
 const recent = new Map<number, { at: number; picture: Promise<Buffer | null> }>();
 
 /**
- * A JPEG of one window as it looks right now, or null if it can't be taken.
+ * A PNG of one window as it looks right now, or null if it can't be taken.
  * `screenId` is macOS's own number for the window. Needs the Screen
  * Recording permission.
  */
@@ -76,4 +76,26 @@ export function pictureOfWindow(screenId: number): Promise<Buffer | null> {
     }
   }
   return picture;
+}
+
+/**
+ * Saves a full-size PNG of one window to `file`. Resolves to whether it
+ * worked. Needs the Screen Recording permission.
+ */
+export function saveWindowPicture(
+  screenId: number,
+  file: string,
+): Promise<boolean> {
+  return takeTurn(async () => {
+    try {
+      await run(
+        "/usr/sbin/screencapture",
+        ["-x", "-o", `-l${screenId}`, "-t", "png", file],
+        { timeout: 10_000 },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }

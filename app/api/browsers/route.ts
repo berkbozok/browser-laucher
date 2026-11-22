@@ -12,6 +12,7 @@ export async function GET(request: Request) {
     browsers: detected.map((browser) => ({
       id: browser.id,
       name: browser.name,
+      engine: browser.engine,
       installed: browser.appPath !== null,
       supportsPrivate: browser.supportsPrivate,
       // Pressing another app's menu is what macOS guards with Accessibility.
