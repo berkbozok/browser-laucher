@@ -425,7 +425,24 @@ function describeWindows(request) {
   return { ok: true, windows: windows, mayCapture: mayCapture() };
 }
 
-// Brings one window to the front of everything.
+// Brings a browser in front of the other apps with only its frontmost
+// window. The ordinary way of activating an app brings all of its windows
+// forward together, so a window's incognito twin would come along.
+function activateFrontWindowOnly(appPath) {
+  var pid = runningApp(appPath).pid;
+  var bundle = $.NSBundle.bundleWithPath(appPath);
+  var copies = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
+    bundle.bundleIdentifier
+  );
+  for (var i = 0; i < copies.count; i++) {
+    var copy = copies.objectAtIndex(i);
+    // 2 is "in front of whatever is active now", without "all windows".
+    if (copy.processIdentifier === pid) return !!copy.activateWithOptions(2);
+  }
+  return false;
+}
+
+// Brings one window to the front of everything, and only that one.
 function focusWindow(request) {
   var running = runningApp(request.appPath);
   var win = windowFor(request, running, request.handle);
@@ -438,13 +455,22 @@ function focusWindow(request) {
   // Front of its own app first, then the app in front of the others.
   try { win.index = 1; } catch (e) {}
   var app = Application(request.appPath);
-  app.activate();
+  var alone = false;
+  try { alone = activateFrontWindowOnly(request.appPath); } catch (e) {}
+  // If macOS won't do it that way, all of the browser's windows coming
+  // forward still beats none.
+  if (!alone) app.activate();
   // Did it really end up in front of the browser's other windows?
   var front = null;
   try {
     front = request.kind === "firefox" ? browserWindowIds(app)[0] : app.windows.id()[0];
   } catch (e) {}
-  return { ok: true, gone: false, inFront: String(front) === String(request.handle.windowId) };
+  return {
+    ok: true,
+    gone: false,
+    inFront: String(front) === String(request.handle.windowId),
+    alone: alone,
+  };
 }
 
 // ---- Acting on windows that are already open --------------------------------
