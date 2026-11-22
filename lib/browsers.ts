@@ -87,7 +87,7 @@ type BrowserDefinition = {
  * Everything was checked on Chrome, Brave, Firefox, Safari, Opera, Edge,
  * Vivaldi, Zen and Orion ("npm run test:live" does it again). The remaining
  * entries with `scripting` are built on the same engines. Entries without it
- * (DuckDuckGo, Arc, Tor) just get the page handed to them: a normal window
+ * (DuckDuckGo, Tor) just get the page handed to them: a normal window
  * only, which the launcher can't follow.
  */
 const CATALOG: readonly BrowserDefinition[] = [
@@ -138,12 +138,6 @@ const CATALOG: readonly BrowserDefinition[] = [
     macApps: ["Microsoft Edge.app"],
     privateFlag: "--inprivate",
     scripting: "chromium",
-  },
-  {
-    id: "arc",
-    name: "Arc",
-    engine: "chromium",
-    macApps: ["Arc.app"],
   },
   {
     id: "vivaldi",

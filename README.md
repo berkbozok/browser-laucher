@@ -92,7 +92,7 @@ for "Browser Launcher" instead of your terminal.
 | Chrome, Brave, Edge, Opera, Vivaldi | yes | yes | yes |
 | Firefox, Zen | yes | yes | yes |
 | Safari, Orion | yes | yes, with Accessibility | yes |
-| DuckDuckGo, Arc, Tor Browser | yes | no | no; close by hand |
+| DuckDuckGo, Tor Browser | yes | no | no; close by hand |
 
 Notes:
 
