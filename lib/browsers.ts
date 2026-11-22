@@ -191,6 +191,14 @@ const CATALOG: readonly BrowserDefinition[] = [
     scripting: "firefox",
   },
   {
+    id: "librewolf",
+    name: "LibreWolf",
+    engine: "firefox",
+    macApps: ["LibreWolf.app"],
+    privateFlag: "--private-window",
+    scripting: "firefox",
+  },
+  {
     id: "orion",
     name: "Orion",
     engine: "webkit",

@@ -120,7 +120,7 @@ for "Browser Launcher" instead of your terminal.
 | Browser | Normal window | Incognito window | Follow, arrange, reload, close |
 | --- | --- | --- | --- |
 | Chrome, Brave, Edge, Opera, Vivaldi | yes | yes | yes |
-| Firefox, Zen | yes | yes | yes |
+| Firefox, Zen, LibreWolf | yes | yes | yes |
 | Safari, Orion | yes | yes, with Accessibility | yes |
 | DuckDuckGo, Tor Browser | yes | no | no; close by hand |
 
@@ -131,10 +131,14 @@ Notes:
   anything of yours with it. The browsers in the last row just get the page
   handed to them and put it wherever they like; DuckDuckGo, for one, switches
   to a tab that already shows that address instead of loading it again.
+- **LibreWolf is Firefox with strict privacy settings**: it blocks trackers
+  and some scripts and hides details about your computer from sites. A page
+  that works everywhere else but not in LibreWolf usually depends on one of
+  those.
 - **Safari and Orion have no command for a private window**, so the launcher
   presses their own *File → New Private Window* for you. That is what needs
   Accessibility.
-- **Firefox and Zen can't say what a window contains.** The launcher
+- **Firefox, Zen and LibreWolf can't say what a window contains.** The launcher
   recognises its window as the one that appeared right after it asked. If the
   browser isn't running it is started first and given time to bring back
   whatever it wants; only then does the launcher add its own window. If it
