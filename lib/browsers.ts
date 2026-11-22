@@ -120,6 +120,14 @@ const CATALOG: readonly BrowserDefinition[] = [
     scripting: "chromium",
   },
   {
+    id: "helium",
+    name: "Helium",
+    engine: "chromium",
+    macApps: ["Helium.app"],
+    privateFlag: "--incognito",
+    scripting: "chromium",
+  },
+  {
     id: "firefox",
     name: "Firefox",
     engine: "firefox",

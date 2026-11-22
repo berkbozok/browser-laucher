@@ -119,7 +119,7 @@ for "Browser Launcher" instead of your terminal.
 
 | Browser | Normal window | Incognito window | Follow, arrange, reload, close |
 | --- | --- | --- | --- |
-| Chrome, Brave, Edge, Opera, Vivaldi | yes | yes | yes |
+| Chrome, Brave, Edge, Opera, Vivaldi, Helium | yes | yes | yes |
 | Firefox, Zen, LibreWolf, Floorp | yes | yes | yes |
 | Safari, Orion | yes | yes, with Accessibility | yes |
 | DuckDuckGo, Tor Browser | yes | no | no; close by hand |

@@ -718,10 +718,18 @@ async function script<T>(request: Record<string, unknown>): Promise<Reply<T>> {
     // unanswered, which is the same situation as a refusal.
     const timedOut =
       typeof error === "object" && error !== null && "killed" in error && error.killed === true;
+    // The error's own message repeats the whole command, script and all, so
+    // say what happened in a line instead, with what osascript printed.
+    const stderr =
+      typeof error === "object" && error !== null && "stderr" in error
+        ? String(error.stderr).trim()
+        : "";
     return {
       ok: false,
       code: timedOut ? NOT_ALLOWED : null,
-      message: error instanceof Error ? error.message : String(error),
+      message: timedOut
+        ? "No answer from the browser in time. macOS may be waiting for you to allow the control prompt."
+        : stderr || "The browser couldn't be scripted.",
     };
   }
 }
