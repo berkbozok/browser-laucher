@@ -46,9 +46,10 @@ launcher's windows in the browsers that are ticked at that moment:
 | Save pictures | Saves a full-size picture of each window into a new folder under `~/Pictures/Browser Launcher` and shows it in Finder. |
 | Close | Closes them, and only them. Windows you opened yourself are never touched. Untick a browser first to keep its windows. |
 
-With **Quit what I started** on, Close also quits a browser the launcher had
-to start, once it has no windows left. A browser that brought back windows
-from last time when it started is left running.
+With **Quit browsers when closing** on, Close also quits a browser, but only
+one that wasn't running until the launcher opened it, and only once it has no
+windows left. A browser you already had open is never quit, and neither is
+one that brought back windows from last time when it started.
 
 ## Permissions macOS asks for
 

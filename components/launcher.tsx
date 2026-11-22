@@ -598,10 +598,11 @@ export function Launcher() {
             </span>
           </Switch>
           <Switch checked={quitStarted} onChange={setQuitStarted}>
-            <span className="font-medium">Quit what I started</span>
+            <span className="font-medium">Quit browsers when closing</span>
             <span className="text-zinc-500 dark:text-zinc-400">
               {" "}
-              — on Close, quit browsers that weren&apos;t open before
+              — only ones that weren&apos;t running until the launcher opened
+              them
             </span>
           </Switch>
         </div>
