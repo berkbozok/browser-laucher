@@ -177,6 +177,42 @@ export type ArrangeRequest = WindowSelection & {
   layout: "tile" | { width: number; height: number };
 };
 
+/** Compare the selected windows with one window picked as the reference. */
+export type CompareRequest = WindowSelection & {
+  /** Key of the window the others are compared with. */
+  reference: string;
+};
+
+/** A rectangle as shares (0 to 1) of a picture's width and height. */
+export type MarkBox = { x: number; y: number; width: number; height: number };
+
+export type PageSize = { width: number; height: number };
+
+/** How one window's page compares with the reference window's. */
+export type WindowComparison =
+  | {
+      key: string;
+      /** Share of the compared page that looks different, 0 to 1. */
+      share: number;
+      /** Separate places that look different. */
+      areas: number;
+      /** Where it looks different, on this window's picture. */
+      marks: MarkBox[];
+      /** Width divided by height of this window's picture. */
+      aspect: number;
+      /** Size of the page area, in screen points. */
+      pageSize: PageSize;
+      referencePageSize: PageSize;
+    }
+  | { key: string; error: string };
+
+export type CompareResponse = {
+  reference: string;
+  /** When the pictures were taken, in milliseconds since 1970. */
+  comparedAt: number;
+  results: WindowComparison[];
+};
+
 export type SnapshotsResponse = {
   /** Where the pictures were saved, or null if none could be. */
   folder: string | null;
@@ -195,7 +231,7 @@ export type SetupResponse = {
     id: string;
     name: string;
     /** Whether the launcher may control this browser. */
-    control: "allowed" | "refused" | "not-running" | "unknown";
+    control: "allowed" | "refused" | "not-running" | "no-windows" | "unknown";
   }[];
 };
 

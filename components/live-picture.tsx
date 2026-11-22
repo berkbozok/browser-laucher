@@ -2,6 +2,14 @@
 
 import Image from "next/image";
 import { useEffect, useState } from "react";
+import type { MarkBox } from "@/lib/types";
+
+/** Places to mark in red on the picture, from a comparison. */
+export type PictureMarks = {
+  /** Width divided by height of the picture the marks were found on. */
+  aspect: number;
+  boxes: MarkBox[];
+};
 
 /**
  * A picture of one of the launcher's windows that keeps itself up to date.
@@ -13,6 +21,7 @@ export function LivePicture({
   every,
   label,
   fit = "cover",
+  marks = null,
   className = "",
 }: {
   windowKey: string;
@@ -22,6 +31,7 @@ export function LivePicture({
   label: string;
   /** "cover" fills the box from the top; "contain" shows the whole window. */
   fit?: "cover" | "contain";
+  marks?: PictureMarks | null;
   className?: string;
 }) {
   const [picture, setPicture] = useState<string | null>(null);
@@ -87,6 +97,28 @@ export function LivePicture({
           Waiting for a picture…
         </span>
       )}
+      {picture && marks && marks.boxes.length > 0 ? (
+        // Scaled and placed exactly like the picture under it.
+        <svg
+          aria-hidden="true"
+          viewBox={`0 0 1000 ${1000 / marks.aspect}`}
+          preserveAspectRatio={
+            fit === "cover" ? "xMidYMin slice" : "xMidYMid meet"
+          }
+          className="pointer-events-none absolute inset-0 size-full"
+        >
+          {marks.boxes.map((box, index) => (
+            <rect
+              key={index}
+              x={box.x * 1000}
+              y={(box.y * 1000) / marks.aspect}
+              width={box.width * 1000}
+              height={(box.height * 1000) / marks.aspect}
+              className="fill-red-500/45"
+            />
+          ))}
+        </svg>
+      ) : null}
     </span>
   );
 }

@@ -18,7 +18,15 @@ Then open <http://127.0.0.1:3000>. Or skip the terminal: see
 
 **Open.** Type a URL, tick the browsers, press **Open**. Turn on **Also open
 in incognito** to get a second, private window in every browser that can do
-it. The URL field remembers the addresses you used lately.
+it. Turn on **Tile after opening** to have the windows laid out side by side
+straight away instead of on top of each other. The URL field remembers the
+addresses you used lately.
+
+A browser that wasn't running is started first and then given its window;
+Chrome-family browsers started this way skip their welcome, "make me your
+default browser" and "restore pages?" prompts. Prompts a page shows itself
+(cookie banners, sign-up boxes) and Safari's or Firefox's own prompts can't be
+turned off from here.
 
 **Pick browsers quickly.** Under the Browsers heading, *Chrome family*,
 *Firefox family* and *Safari family* tick a whole family at once, and
@@ -44,7 +52,25 @@ launcher's windows in the browsers that are ticked at that moment:
 | Reload | Reloads every window. |
 | Arrange… | Tiles them to fill the screen, or gives them all one width (narrow, tablet, laptop, desktop) to compare layouts. |
 | Save pictures | Saves a full-size picture of each window into a new folder under `~/Pictures/Browser Launcher` and shows it in Finder. |
+| Compare with… | Pick one window as the reference. Every other window gets a label (**Same** or **N differences**) and the places where its page looks different are marked in red on its picture, also in the enlarged view. |
 | Close | Closes them, and only them. Windows you opened yourself are never touched. Untick a browser first to keep its windows. |
+
+**Comparing pages.** The comparison leaves out each browser's own toolbar
+and sidebar, lines the pages up, and looks at 16-point squares by colour and
+amount of detail, so letters drawn a shade differently don't count but a box
+that moved, a missing image or a line that wraps differently does. Two
+things make pages differ that aren't the page's fault:
+
+- *Page width.* A sidebar (Opera) or a window frame makes the page a few
+  points narrower, and text then wraps differently. When that happens the
+  line above the windows offers **Match page widths**, which resizes the
+  windows so every page is exactly as wide as the reference's and compares
+  again.
+- *Things that change by themselves*: pop-ups, banners, adverts, animations.
+  They are marked because they really do look different.
+
+The marks belong to the moment of comparing; Go to address, Reload and
+Arrange clear them, and **Compare again** retakes them.
 
 With **Quit browsers when closing** on, Close also quits a browser, but only
 one that wasn't running until the launcher opened it, and only once it has no

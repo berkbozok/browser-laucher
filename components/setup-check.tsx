@@ -39,7 +39,9 @@ function linesFor(setup: SetupResponse): Line[] {
           ? "macOS hasn't allowed it, or is still waiting for your answer. System Settings → Privacy & Security → Automation."
           : browser.control === "not-running"
             ? "Can only be checked while the browser is open."
-            : "Couldn't be checked.",
+            : browser.control === "no-windows"
+              ? "Can only be checked while it has a window open."
+              : "Couldn't be checked.",
     });
   }
   return lines;

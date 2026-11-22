@@ -56,7 +56,10 @@ async function capture(screenId: number): Promise<Buffer | null> {
   }
 }
 
-const recent = new Map<number, { at: number; picture: Promise<Buffer | null> }>();
+const recent = new Map<
+  number,
+  { at: number; picture: Promise<Buffer | null> }
+>();
 
 /**
  * A PNG of one window as it looks right now, or null if it can't be taken.
@@ -96,6 +99,52 @@ export function saveWindowPicture(
       return true;
     } catch {
       return false;
+    }
+  });
+}
+
+/**
+ * A picture of one window for comparing: a BMP file `width` pixels wide
+ * (easy to read without extra packages), or null if it can't be taken.
+ */
+export function comparablePictureOfWindow(
+  screenId: number,
+  width: number,
+): Promise<Uint8Array | null> {
+  return takeTurn(async () => {
+    const folder = await mkdtemp(
+      path.join(
+        /* turbopackIgnore: true */ tmpdir(),
+        "browser-launcher-compare-",
+      ),
+    );
+    try {
+      const shot = path.join(/* turbopackIgnore: true */ folder, "window.png");
+      const small = path.join(/* turbopackIgnore: true */ folder, "window.bmp");
+      await run(
+        "/usr/sbin/screencapture",
+        ["-x", "-o", `-l${screenId}`, "-t", "png", shot],
+        { timeout: 5000 },
+      );
+      await run(
+        "/usr/bin/sips",
+        [
+          "--resampleWidth",
+          String(width),
+          "-s",
+          "format",
+          "bmp",
+          shot,
+          "--out",
+          small,
+        ],
+        { timeout: 5000 },
+      );
+      return new Uint8Array(await readFile(small));
+    } catch {
+      return null;
+    } finally {
+      await rm(folder, { recursive: true, force: true });
     }
   });
 }

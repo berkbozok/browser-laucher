@@ -3,12 +3,24 @@ import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  comparePictures,
+  PIXELS_PER_POINT,
+  pictureFromBmp,
+  SAME_WIDTH_WITHIN,
+  type Picture,
+} from "./compare";
 import { arrange, type Layout } from "./layout";
-import { pictureOfWindow, saveWindowPicture } from "./preview";
+import {
+  comparablePictureOfWindow,
+  pictureOfWindow,
+  saveWindowPicture,
+} from "./preview";
 import type {
   ActionResult,
   BrowserInfo,
   CloseResult,
+  CompareResponse,
   FocusResponse,
   OpenResult,
   OpenWindow,
@@ -40,12 +52,12 @@ import {
   focusTrackedWindow,
   navigateTrackedWindows,
   openTrackedWindow,
-  quitBrowserIfEmpty,
   reloadTrackedWindows,
   usableScreenArea,
   type ActedHow,
   type ActOutcome,
   type CommandLineSteps,
+  type ScreenRect,
   type ScriptingKind,
 } from "./window-control";
 
@@ -501,7 +513,13 @@ export async function openInBrowsers(
       const windows: Omit<RegisteredWindow, "key">[] = [];
       const add = (handle: WindowHandle | undefined, isPrivate: boolean) => {
         if (!handle) return;
-        windows.push({ browser: result.id, handle, private: isPrivate, url, launch });
+        windows.push({
+          browser: result.id,
+          handle,
+          private: isPrivate,
+          url,
+          launch,
+        });
       };
       add(result.handle, false);
       if (result.privateWindow?.status === "opened") {
@@ -581,44 +599,46 @@ export async function listOpenWindows(): Promise<WindowsResponse> {
   let mayCapture: boolean | null = null;
 
   const groups = await Promise.all(
-    [...byBrowser(registered)].map(async ([id, items]): Promise<OpenWindow[]> => {
-      const browser = drivable(detected.get(id));
-      if (!browser) {
-        // The browser was removed. Nothing can be done with these any more.
-        items.forEach((item) => gone.add(item.key));
-        return [];
-      }
-      const outcome = await describeTrackedWindows(
-        browser.scripting,
-        browser.appPath,
-        items.map((item) => item.handle),
-      );
-      // No answer tells us nothing about the windows, so keep listing them
-      // as they were opened.
-      const states = outcome.ok ? outcome.windows : null;
-      if (outcome.ok && outcome.mayCapture !== null) {
-        mayCapture = mayCapture === true || outcome.mayCapture;
-      }
-      return items.flatMap((item, index): OpenWindow[] => {
-        const state = states?.[index];
-        if (state && !state.open) {
-          gone.add(item.key);
+    [...byBrowser(registered)].map(
+      async ([id, items]): Promise<OpenWindow[]> => {
+        const browser = drivable(detected.get(id));
+        if (!browser) {
+          // The browser was removed. Nothing can be done with these any more.
+          items.forEach((item) => gone.add(item.key));
           return [];
         }
-        return [
-          {
-            key: item.key,
-            browser: id,
-            private: item.private,
-            openedUrl: item.url,
-            launch: item.launch,
-            title: state?.title,
-            url: state?.url,
-            hasPreview: typeof item.handle.screenId === "number",
-          },
-        ];
-      });
-    }),
+        const outcome = await describeTrackedWindows(
+          browser.scripting,
+          browser.appPath,
+          items.map((item) => item.handle),
+        );
+        // No answer tells us nothing about the windows, so keep listing them
+        // as they were opened.
+        const states = outcome.ok ? outcome.windows : null;
+        if (outcome.ok && outcome.mayCapture !== null) {
+          mayCapture = mayCapture === true || outcome.mayCapture;
+        }
+        return items.flatMap((item, index): OpenWindow[] => {
+          const state = states?.[index];
+          if (state && !state.open) {
+            gone.add(item.key);
+            return [];
+          }
+          return [
+            {
+              key: item.key,
+              browser: id,
+              private: item.private,
+              openedUrl: item.url,
+              launch: item.launch,
+              title: state?.title,
+              url: state?.url,
+              hasPreview: typeof item.handle.screenId === "number",
+            },
+          ];
+        });
+      },
+    ),
   );
 
   await forgetWindows(gone);
@@ -647,13 +667,18 @@ export async function closeOpenWindows(
       const name = detected.get(id)?.name ?? id;
       const nothing = { id, name, closed: 0, alreadyGone: 0 };
       if (!browser) {
-        return { ...nothing, error: "This browser's windows can't be closed from here." };
+        return {
+          ...nothing,
+          error: "This browser's windows can't be closed from here.",
+        };
       }
 
+      const runs = started.filter((run) => run.browser === id);
       const outcome = await closeTrackedWindows(
         browser.scripting,
         browser.appPath,
         items.map((item) => item.handle),
+        runs,
       );
       if (!outcome.ok) {
         return {
@@ -676,11 +701,10 @@ export async function closeOpenWindows(
         alreadyGone: count("gone"),
       };
 
-      for (const run of started.filter((r) => r.browser === id)) {
-        if (await quitBrowserIfEmpty(browser.scripting, browser.appPath, run)) {
-          result.quit = true;
-          finishedRuns.push(run);
-        }
+      if (outcome.quit) {
+        result.quit = true;
+        // It is gone, so every run we had noted for it is over.
+        finishedRuns.push(...runs);
       }
 
       const stuck = count("stuck");
@@ -717,7 +741,10 @@ async function actOnWindows(
       const name = detected.get(id)?.name ?? id;
       const nothing = { id, name, done: 0, gone: 0 };
       if (!browser) {
-        return { ...nothing, error: "This browser's windows can't be reached from here." };
+        return {
+          ...nothing,
+          error: "This browser's windows can't be reached from here.",
+        };
       }
 
       const outcome = await act(browser, items);
@@ -800,7 +827,9 @@ async function replaceWindows(
     await arrangeTrackedWindows(browser.scripting, browser.appPath, [
       { handle: fresh.handle, bounds: place },
     ]);
-    await closeTrackedWindows(browser.scripting, browser.appPath, [item.handle]);
+    await closeTrackedWindows(browser.scripting, browser.appPath, [
+      item.handle,
+    ]);
     await forgetWindows(new Set([item.key]));
     outcomes.push("done");
   }
@@ -869,7 +898,10 @@ export async function arrangeOpenWindows(
   const order = (await detectBrowsers()).map((b) => b.id);
   const all = inListOrder(await selectWindows(selection), order);
   const spots = new Map(
-    arrange(area, all.length, layout).map((rect, index) => [all[index].key, rect]),
+    arrange(area, all.length, layout).map((rect, index) => [
+      all[index].key,
+      rect,
+    ]),
   );
 
   return actOnWindows(selection, (browser, items) =>
@@ -1000,6 +1032,181 @@ export async function pictureOfOpenWindow(key: string): Promise<Buffer | null> {
   const screenId = item?.handle.screenId;
   if (typeof screenId !== "number") return null;
   return pictureOfWindow(screenId);
+}
+
+type Measured = {
+  item: RegisteredWindow;
+  /** Where the window is on the screen, in points. */
+  bounds: ScreenRect;
+  /** A small picture of it, PIXELS_PER_POINT pixels a point. */
+  picture: Picture;
+};
+
+/** Each window's place on the screen and a picture of it, or why not. */
+async function measureWindows(
+  items: RegisteredWindow[],
+): Promise<Map<string, Measured | string>> {
+  const detected = new Map((await detectBrowsers()).map((b) => [b.id, b]));
+  const measured = new Map<string, Measured | string>();
+  await Promise.all(
+    [...byBrowser(items)].map(async ([id, group]) => {
+      const browser = drivable(detected.get(id));
+      if (!browser) {
+        for (const item of group) {
+          measured.set(
+            item.key,
+            "This browser's windows can't be reached from here.",
+          );
+        }
+        return;
+      }
+      const bounds = await boundsOfTrackedWindows(
+        browser.scripting,
+        browser.appPath,
+        group.map((item) => item.handle),
+      );
+      await Promise.all(
+        group.map(async (item, index) => {
+          const rect = bounds[index];
+          const screenId = item.handle.screenId;
+          if (!rect) {
+            measured.set(item.key, "This window has been closed.");
+            return;
+          }
+          if (typeof screenId !== "number") {
+            measured.set(item.key, "No picture can be taken of this window.");
+            return;
+          }
+          const file = await comparablePictureOfWindow(
+            screenId,
+            Math.max(100, Math.round(rect.width * PIXELS_PER_POINT)),
+          );
+          const picture = file ? pictureFromBmp(file) : null;
+          measured.set(
+            item.key,
+            picture
+              ? { item, bounds: rect, picture }
+              : "No picture could be taken of this window. Is it minimised?",
+          );
+        }),
+      );
+    }),
+  );
+  return measured;
+}
+
+/** The reference window and the selected windows to hold up against it. */
+async function comparisonSet(
+  selection: WindowSelection,
+  referenceKey: string,
+): Promise<{
+  reference: Measured;
+  others: RegisteredWindow[];
+  measured: Map<string, Measured | string>;
+}> {
+  const registered = await listRegisteredWindows();
+  const referenceItem = registered.find((w) => w.key === referenceKey);
+  if (!referenceItem) {
+    throw new Error("The window to compare with has been closed.");
+  }
+  const keys = selection.keys ? new Set(selection.keys) : null;
+  const ids = new Set(selection.browsers ?? []);
+  const others = registered.filter(
+    (w) =>
+      w.key !== referenceKey && (keys ? keys.has(w.key) : ids.has(w.browser)),
+  );
+  const measured = await measureWindows([referenceItem, ...others]);
+  const reference = measured.get(referenceKey);
+  if (typeof reference !== "object") {
+    throw new Error(
+      `Couldn't take a picture of the window to compare with. ${reference ?? ""} Live pictures need the Screen Recording permission (see Check setup).`.trim(),
+    );
+  }
+  return { reference, others, measured };
+}
+
+/**
+ * Holds each selected window's page up against the reference window's and
+ * marks where they look different.
+ */
+export async function compareOpenWindows(
+  selection: WindowSelection,
+  referenceKey: string,
+): Promise<CompareResponse> {
+  const comparedAt = Date.now();
+  const { reference, others, measured } = await comparisonSet(
+    selection,
+    referenceKey,
+  );
+  const results = others.map((item) => {
+    const other = measured.get(item.key);
+    if (typeof other !== "object") {
+      return {
+        key: item.key,
+        error: other ?? "This window couldn't be compared.",
+      };
+    }
+    const found = comparePictures(reference.picture, other.picture);
+    if (!found.aligned) {
+      return {
+        key: item.key,
+        error: "The two pages are too different to line up.",
+      };
+    }
+    return {
+      key: item.key,
+      share: found.share,
+      areas: found.areas,
+      marks: found.marks,
+      aspect: other.picture.width / other.picture.height,
+      pageSize: found.pageSizes[1],
+      referencePageSize: found.pageSizes[0],
+    };
+  });
+  return { reference: referenceKey, comparedAt, results };
+}
+
+/**
+ * Makes each selected window wider or narrower so that its page is as wide
+ * as the reference window's page. Browsers with a sidebar or a thicker
+ * frame otherwise lay the same page out narrower, and text wraps
+ * differently. Windows keep their place on the screen.
+ */
+export async function matchPageWidths(
+  selection: WindowSelection,
+  referenceKey: string,
+): Promise<ActionResult[]> {
+  const { reference, others, measured } = await comparisonSet(
+    selection,
+    referenceKey,
+  );
+  const targets = new Map<string, ScreenRect>();
+  for (const item of others) {
+    const other = measured.get(item.key);
+    if (typeof other !== "object") continue;
+    const [want, have] = comparePictures(
+      reference.picture,
+      other.picture,
+    ).pageSizes;
+    const change = want.width - have.width;
+    if (Math.abs(change) <= SAME_WIDTH_WITHIN) continue;
+    targets.set(item.key, {
+      ...other.bounds,
+      width: other.bounds.width + change,
+    });
+  }
+  if (targets.size === 0) return [];
+
+  return actOnWindows({ keys: [...targets.keys()] }, (browser, items) =>
+    arrangeTrackedWindows(
+      browser.scripting,
+      browser.appPath,
+      items.map((item) => ({
+        handle: item.handle,
+        bounds: targets.get(item.key)!,
+      })),
+    ),
+  );
 }
 
 /**

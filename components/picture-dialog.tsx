@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { LivePicture } from "@/components/live-picture";
+import { LivePicture, type PictureMarks } from "@/components/live-picture";
 import type { BrowserInfo, OpenWindow } from "@/lib/types";
 import { shortAddress } from "@/lib/window-rows";
 
@@ -13,6 +13,7 @@ export function PictureDialog({
   browser,
   target,
   live,
+  marks,
   onDismiss,
   onShow,
   onReload,
@@ -22,6 +23,8 @@ export function PictureDialog({
   target: OpenWindow;
   /** Whether pictures can be taken at all. */
   live: boolean;
+  /** Where it differs from the reference window, from the last comparison. */
+  marks: PictureMarks | null;
   onDismiss: () => void;
   onShow: () => void;
   onReload: () => void;
@@ -91,6 +94,7 @@ export function PictureDialog({
             every={1000}
             label={`${browser.name}, ${kind} window`}
             fit="contain"
+            marks={marks}
             className="aspect-[16/10] w-full rounded-lg"
           />
         ) : (

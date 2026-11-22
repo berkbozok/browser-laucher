@@ -26,6 +26,8 @@ import type {
   CloseRequest,
   CloseResponse,
   CloseResult,
+  CompareRequest,
+  CompareResponse,
   FocusRequest,
   FocusResponse,
   NavigateRequest,
@@ -54,6 +56,8 @@ type Prefs = {
   incognito: boolean;
   /** Quit browsers the launcher had to start, when closing their windows. */
   quitStarted: boolean;
+  /** Tile the windows to fill the screen as soon as they are open. */
+  tileOnOpen: boolean;
   /** Addresses opened lately, newest first. */
   recent: string[];
   groups: SavedGroup[];
@@ -97,6 +101,7 @@ function readPrefs(): Prefs | null {
       incognito: saved.incognito === true,
       // On unless it was switched off.
       quitStarted: saved.quitStarted !== false,
+      tileOnOpen: saved.tileOnOpen === true,
       recent: strings(saved.recent).slice(0, RECENT_MAX),
       groups: groups.flatMap((group: unknown): SavedGroup[] => {
         if (typeof group !== "object" || group === null) return [];
@@ -117,8 +122,10 @@ function writePrefs(prefs: Prefs): void {
   }
 }
 
-const without = <T,>(record: Record<string, T>, drop: (key: string) => boolean) =>
-  Object.fromEntries(Object.entries(record).filter(([key]) => !drop(key)));
+const without = <T,>(
+  record: Record<string, T>,
+  drop: (key: string) => boolean,
+) => Object.fromEntries(Object.entries(record).filter(([key]) => !drop(key)));
 
 export function Launcher() {
   const [data, setData] = useState<BrowsersResponse | null>(null);
@@ -130,6 +137,7 @@ export function Launcher() {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [incognito, setIncognito] = useState(false);
   const [quitStarted, setQuitStarted] = useState(true);
+  const [tileOnOpen, setTileOnOpen] = useState(false);
   const [recent, setRecent] = useState<string[]>([]);
   const [groups, setGroups] = useState<SavedGroup[]>([]);
 
@@ -144,6 +152,8 @@ export function Launcher() {
   const [lost, setLost] = useState<Record<string, LostNote>>({});
   // The window shown large, by key.
   const [enlarged, setEnlarged] = useState<string | null>(null);
+  /** The last comparison of windows with a reference window. */
+  const [comparison, setComparison] = useState<CompareResponse | null>(null);
 
   const [formError, setFormError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -190,6 +200,7 @@ export function Launcher() {
         if (prefs.url) setUrl((current) => current || prefs.url);
         setIncognito(prefs.incognito);
         setQuitStarted(prefs.quitStarted);
+        setTileOnOpen(prefs.tileOnOpen);
         setRecent(prefs.recent);
         setGroups(prefs.groups);
       })
@@ -212,10 +223,11 @@ export function Launcher() {
       selected: [...selected],
       incognito,
       quitStarted,
+      tileOnOpen,
       recent,
       groups,
     });
-  }, [data, url, selected, incognito, quitStarted, recent, groups]);
+  }, [data, url, selected, incognito, quitStarted, tileOnOpen, recent, groups]);
 
   // Keep the list of open windows current: what each shows, and which are
   // gone (closed by hand, browser quit). Paused while an Open or Close is
@@ -251,7 +263,9 @@ export function Launcher() {
   // Browsers without a private mode still get their normal window.
   const windowCount =
     chosen.length +
-    (incognito ? chosen.filter((browser) => browser.supportsPrivate).length : 0);
+    (incognito
+      ? chosen.filter((browser) => browser.supportsPrivate).length
+      : 0);
 
   // Everything done to "the open windows" only touches the browsers that are
   // ticked right now.
@@ -281,6 +295,14 @@ export function Launcher() {
       : [];
   });
   const enlargedWindow = windows.find((w) => w.key === enlarged) ?? null;
+  // Marks only mean something while the window they were measured against is open.
+  const liveComparison =
+    comparison && windows.some((w) => w.key === comparison.reference)
+      ? comparison
+      : null;
+  const enlargedResult = liveComparison?.results.find(
+    (result) => result.key === enlarged,
+  );
   const enlargedBrowser = installed.find(
     (browser) => browser.id === enlargedWindow?.browser,
   );
@@ -339,6 +361,7 @@ export function Launcher() {
     const ids = chosen.map((browser) => browser.id);
     setFormError(null);
     setNotice(null);
+    setComparison(null);
     setBusy("opening");
     setLaunch(Object.fromEntries(ids.map((id) => [id, { status: "opening" }])));
 
@@ -372,7 +395,32 @@ export function Launcher() {
         }
         return next;
       });
-      setNotice(summarizeOpen(results));
+      let summary = summarizeOpen(results);
+      if (tileOnOpen && summary) {
+        // Lay them out straight away, together with any that were open already.
+        const request: ArrangeRequest = { browsers: ids, layout: "tile" };
+        try {
+          const arranged = await postJson<ActionResponse>(
+            "/api/arrange",
+            request,
+          );
+          const trouble = arranged.results
+            .filter((result) => result.error)
+            .map((result) => `${result.name}: ${result.error}`);
+          if (trouble.length > 0) {
+            summary = {
+              text: `${summary.text} Couldn't arrange some windows. ${trouble.join(" ")}`,
+              allGood: false,
+            };
+          }
+        } catch (error) {
+          summary = {
+            text: `${summary.text} Couldn't arrange the windows: ${toMessage(error)}`,
+            allGood: false,
+          };
+        }
+      }
+      setNotice(summary);
     } catch (error) {
       setLaunch({});
       setFormError(toMessage(error));
@@ -435,8 +483,12 @@ export function Launcher() {
     const target = readAddress();
     if (!target) return;
     const request: NavigateRequest = { browsers: ticked, url: target };
+    setComparison(null);
     void run(async () => {
-      const { results } = await postJson<ActionResponse>("/api/navigate", request);
+      const { results } = await postJson<ActionResponse>(
+        "/api/navigate",
+        request,
+      );
       return summarizeAction(
         (count) => `Sent ${plural(count, "window")} to ${target}.`,
         results,
@@ -445,8 +497,12 @@ export function Launcher() {
   }
 
   function reload(selection: WindowSelection) {
+    setComparison(null);
     void run(async () => {
-      const { results } = await postJson<ActionResponse>("/api/reload", selection);
+      const { results } = await postJson<ActionResponse>(
+        "/api/reload",
+        selection,
+      );
       return summarizeAction(
         (count) => `Reloaded ${plural(count, "window")}.`,
         results,
@@ -456,8 +512,12 @@ export function Launcher() {
 
   function arrangeAll(layout: Layout) {
     const request: ArrangeRequest = { browsers: ticked, layout };
+    setComparison(null);
     void run(async () => {
-      const { results } = await postJson<ActionResponse>("/api/arrange", request);
+      const { results } = await postJson<ActionResponse>(
+        "/api/arrange",
+        request,
+      );
       return summarizeAction(
         (count) => `Arranged ${plural(count, "window")}.`,
         results,
@@ -468,10 +528,16 @@ export function Launcher() {
   function savePictures() {
     const selection: WindowSelection = { browsers: ticked };
     void run(async () => {
-      const result = await postJson<SnapshotsResponse>("/api/snapshots", selection);
+      const result = await postJson<SnapshotsResponse>(
+        "/api/snapshots",
+        selection,
+      );
       if (result.error) throw new Error(result.error);
       if (!result.folder) {
-        return { text: "There were no windows to take pictures of.", allGood: false };
+        return {
+          text: "There were no windows to take pictures of.",
+          allGood: false,
+        };
       }
       const missed =
         result.missed.length > 0
@@ -484,6 +550,43 @@ export function Launcher() {
     });
   }
 
+  function compareWith(reference: string) {
+    const request: CompareRequest = { browsers: ticked, reference };
+    void run(async () => {
+      setComparison(await postJson<CompareResponse>("/api/compare", request));
+      // The line above the windows says how it went.
+      return null;
+    });
+  }
+
+  function matchWidths() {
+    if (!liveComparison) return;
+    const request: CompareRequest = {
+      browsers: ticked,
+      reference: liveComparison.reference,
+    };
+    void run(async () => {
+      const { results } = await postJson<ActionResponse>(
+        "/api/match-widths",
+        request,
+      );
+      // Give the pages a moment to lay themselves out again, then look again.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      setComparison(await postJson<CompareResponse>("/api/compare", request));
+      if (results.length === 0) {
+        return {
+          text: "The pages were already the same width.",
+          allGood: true,
+        };
+      }
+      return summarizeAction(
+        (count) =>
+          `Resized ${plural(count, "window")} so the pages are as wide as the reference's, and compared again.`,
+        results,
+      );
+    });
+  }
+
   // --- things done to one window ---
 
   async function showWindow(target: OpenWindow) {
@@ -493,7 +596,10 @@ export function Launcher() {
       const { gone } = await postJson<FocusResponse>("/api/focus", request);
       if (!gone) return;
       setWindows((current) => current.filter((w) => w.key !== target.key));
-      setNotice({ text: "That window had already been closed.", allGood: false });
+      setNotice({
+        text: "That window had already been closed.",
+        allGood: false,
+      });
     } catch (error) {
       setFormError(toMessage(error));
     }
@@ -597,6 +703,13 @@ export function Launcher() {
               — a second, private window in each browser
             </span>
           </Switch>
+          <Switch checked={tileOnOpen} onChange={setTileOnOpen}>
+            <span className="font-medium">Tile after opening</span>
+            <span className="text-zinc-500 dark:text-zinc-400">
+              {" "}
+              — lay the windows out side by side straight away
+            </span>
+          </Switch>
           <Switch checked={quitStarted} onChange={setQuitStarted}>
             <span className="font-medium">Quit browsers when closing</span>
             <span className="text-zinc-500 dark:text-zinc-400">
@@ -638,12 +751,19 @@ export function Launcher() {
         onReloadAll={() => reload({ browsers: ticked })}
         onArrange={arrangeAll}
         onSavePictures={savePictures}
+        comparison={liveComparison}
+        onCompare={compareWith}
+        onMatchWidths={matchWidths}
+        onClearComparison={() => setComparison(null)}
         onDismissLost={(id) =>
           setLost((current) => without(current, (key) => key === id))
         }
       />
 
-      <section aria-labelledby="browsers-heading" className="flex flex-col gap-3">
+      <section
+        aria-labelledby="browsers-heading"
+        className="flex flex-col gap-3"
+      >
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
           <h2 id="browsers-heading" className="text-sm font-medium">
             Browsers
@@ -754,8 +874,8 @@ export function Launcher() {
             <span>
               <strong className="font-semibold">
                 {nameList.format(needSetup)}{" "}
-                {needSetup.length === 1 ? "needs" : "need"} a one-time setup
-                for incognito.
+                {needSetup.length === 1 ? "needs" : "need"} a one-time setup for
+                incognito.
               </strong>{" "}
               In System Settings → Privacy &amp; Security → Accessibility, turn
               on the app that runs this launcher (Terminal, Cursor, …), and
@@ -781,6 +901,11 @@ export function Launcher() {
           browser={enlargedBrowser}
           target={enlargedWindow}
           live={mayCapture !== false}
+          marks={
+            enlargedResult && !("error" in enlargedResult)
+              ? { aspect: enlargedResult.aspect, boxes: enlargedResult.marks }
+              : null
+          }
           onDismiss={() => setEnlarged(null)}
           onShow={() => void showWindow(enlargedWindow)}
           onReload={() => reload({ keys: [enlargedWindow.key] })}
@@ -914,7 +1039,9 @@ function LaunchStatus({
     if (openCount > 0) {
       return <span className={muted}>{plural(openCount, "window")} open</span>;
     }
-    return normalOnly ? <span className={muted}>Normal window only</span> : null;
+    return normalOnly ? (
+      <span className={muted}>Normal window only</span>
+    ) : null;
   }
   if (state.status === "opening") {
     return <span className={muted}>Opening…</span>;

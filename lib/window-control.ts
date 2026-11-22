@@ -17,6 +17,29 @@ const run = promisify(execFile);
  */
 export type ScriptingKind = "chromium" | "safari" | "firefox";
 
+/**
+ * Switches for a Chrome-family browser that the launcher has to start. They
+ * keep it from greeting us with things that sit on top of the page or wait
+ * for an answer: the first-run welcome, "make this your default browser",
+ * and "restore pages?" after it was force-quit. They last for that run of
+ * the browser only.
+ */
+const QUIET_START = [
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--hide-crash-restore-bubble",
+];
+
+async function isRunning(appPath: string): Promise<boolean> {
+  try {
+    // pgrep exits with an error when nothing matches.
+    await run("/usr/bin/pgrep", ["-f", `${appPath}/Contents/MacOS/`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** macOS's "the user hasn't allowed this app to control that one". */
 const NOT_ALLOWED = -1743;
 /**
@@ -142,26 +165,48 @@ function waitUntil(test, seconds) {
   }
 }
 
-// Starts a browser that isn't running and gives its own first window a
-// moment to appear, so we can tell that window from the ones we make.
-function coldStart(app) {
-  app.launch();
-  waitUntil(function () { return app.windows.length > 0; }, 8);
+// Starts a browser that isn't running and waits until it answers and has put
+// up its own first window. Hands back a fresh connection to it: one made
+// before the browser was up can go stale while it starts.
+function coldStart(appPath) {
+  // It may already be on its way up, started with switches of our choosing.
+  if (pidOf(appPath) === 0) Application(appPath).launch();
+  waitUntil(function () { return Application(appPath).windows.length > 0; }, 12);
   delay(0.7);
+  return Application(appPath);
 }
 
-// A browser that was just started shows one empty "new tab" window. Using it
-// for the page avoids leaving a stray blank window behind. Anything else the
-// browser brought back (restored tabs, a home page) is the user's: leave it.
-function chromiumBlankWindow(app) {
-  var windows = app.windows();
-  if (windows.length !== 1 || windows[0].mode() !== "normal") return null;
-  var tabs = windows[0].tabs();
-  if (tabs.length !== 1) return null;
-  var url = String(tabs[0].url() || "");
-  var blank = url === "" || url === "about:blank" ||
-    /^[a-z-]+:\/\/(newtab|new-tab-page|startpage|startpageshared|start-page)\b/i.test(url);
-  return blank ? windows[0].id() : null;
+// A page of the browser's own rather than one from the web: its new-tab
+// page, start page, speed dial and so on. Each browser names these its own
+// way, so the test is simply "not a web address".
+function isOwnPage(url) {
+  url = String(url || "");
+  // Edge's new-tab page is the exception: it lives on the web.
+  if (/^https:\/\/ntp\.msn\.com\//i.test(url)) return true;
+  return !/^(https?|file):/i.test(url);
+}
+
+// A browser that we had to start puts up a window of its own showing its
+// start page. Once ours is open, that one is only clutter, and it would keep
+// the browser from counting as empty when our windows are closed again.
+// Anything the browser brought back from the web (restored tabs, a home
+// page) is the user's: leave it.
+function closeBlankStartWindows(request, app, keepId) {
+  if (request.kind === "firefox") return; // it can't say what a window shows
+  app.windows.id().forEach(function (id) {
+    if (String(id) === String(keepId)) return;
+    try {
+      var win = app.windows.byId(id);
+      var blank;
+      if (request.kind === "chromium") {
+        var tabs = win.tabs();
+        blank = win.mode() === "normal" && tabs.length === 1 && isOwnPage(tabs[0].url());
+      } else {
+        blank = win.visible() && win.tabs.length === 1 && isOwnPage(win.currentTab.url());
+      }
+      if (blank) win.close();
+    } catch (error) {}
+  });
 }
 
 function makeChromiumWindow(app, properties) {
@@ -183,26 +228,19 @@ function makeChromiumWindow(app, properties) {
 }
 
 function openChromium(request) {
-  var app = Application(request.appPath);
-  var id = null;
-  var wasClosed = pidOf(request.appPath) === 0;
-  if (wasClosed) {
-    coldStart(app);
-    if (!request.private) id = chromiumBlankWindow(app);
-  }
-  if (id === null) {
-    id = makeChromiumWindow(app, request.private ? { mode: "incognito" } : {});
-    // Never report a private window that isn't one. A browser that has
-    // private browsing switched off hands back a normal window instead.
-    if (request.private && app.windows.byId(id).mode() !== "incognito") {
-      app.windows.byId(id).close();
-      return {
-        ok: false,
-        code: null,
-        privateUnavailable: true,
-        message: "The browser opened a normal window when asked for a private one.",
-      };
-    }
+  var wasClosed = request.justStarted === true || pidOf(request.appPath) === 0;
+  var app = wasClosed ? coldStart(request.appPath) : Application(request.appPath);
+  var id = makeChromiumWindow(app, request.private ? { mode: "incognito" } : {});
+  // Never report a private window that isn't one. A browser that has
+  // private browsing switched off hands back a normal window instead.
+  if (request.private && app.windows.byId(id).mode() !== "incognito") {
+    app.windows.byId(id).close();
+    return {
+      ok: false,
+      code: null,
+      privateUnavailable: true,
+      message: "The browser opened a normal window when asked for a private one.",
+    };
   }
   // A window that was made an instant ago may not have its tab yet.
   var loaded = waitUntil(function () {
@@ -211,17 +249,11 @@ function openChromium(request) {
   }, 4);
   if (!loaded) throw new Error("The new window never became ready for an address.");
   app.activate();
+  if (wasClosed) {
+    delay(0.8); // the browser's own window can turn up a little after ours
+    closeBlankStartWindows(request, app, id);
+  }
   return opened(request, id, wasClosed);
-}
-
-function safariBlankWindow(app) {
-  var documents = app.documents();
-  if (documents.length !== 1) return null;
-  var url = String(documents[0].url() || "");
-  if (url !== "" && url !== "favorites://") return null;
-  var windows = app.windows().filter(function (w) { return w.visible(); });
-  if (windows.length !== 1 || windows[0].tabs.length !== 1) return null;
-  return windows[0].id();
 }
 
 // Presses File > New Private Window in Safari, which has no command for it.
@@ -248,7 +280,7 @@ function openSafariPrivate(app, request) {
   var before = app.windows.id();
   try {
     if (!pressNewPrivateWindow(pidOf(request.appPath))) {
-      return { ok: false, code: null, message: "Safari's New Private Window menu item wasn't found." };
+      return { ok: false, code: null, message: "The browser's New Private Window menu item wasn't found." };
     }
   } catch (error) {
     return interfaceProblem(error);
@@ -258,40 +290,36 @@ function openSafariPrivate(app, request) {
     return ids.length === 1 ? ids : null;
   }, 6);
   if (!fresh) {
-    return { ok: false, code: null, message: "Safari didn't open a private window." };
+    return { ok: false, code: null, message: "The browser didn't open a private window." };
   }
   app.windows.byId(fresh[0]).currentTab.url = request.url;
   return opened(request, fresh[0], false);
 }
 
 function openSafari(request) {
-  var app = Application(request.appPath);
-  var wasClosed = pidOf(request.appPath) === 0;
-  if (wasClosed) coldStart(app);
+  var wasClosed = request.justStarted === true || pidOf(request.appPath) === 0;
+  var app = wasClosed ? coldStart(request.appPath) : Application(request.appPath);
   if (request.private) return openSafariPrivate(app, request);
 
-  var id = wasClosed ? safariBlankWindow(app) : null;
-  if (id !== null) {
-    app.windows.byId(id).currentTab.url = request.url;
-  } else {
-    // The new document's window is found as the one that wasn't there
-    // before. Taking "the front window" instead would be wrong whenever
-    // another window comes forward at the same moment, and Close would then
-    // shut a window the launcher never opened.
-    var before = app.windows.id();
-    app.Document({ url: request.url }).make();
-    var fresh = waitUntil(function () {
-      var ids = app.windows.id().filter(function (w) { return before.indexOf(w) === -1; });
-      return ids.length === 1 ? ids : null;
-    }, 6);
-    if (!fresh) {
-      app.activate();
-      return { ok: true, unidentified: "Safari opened the page, but its new window couldn't be picked out." };
-    }
-    id = fresh[0];
-  }
+  // The new document's window is found as the one that wasn't there before.
+  // Taking "the front window" instead would be wrong whenever another window
+  // comes forward at the same moment, and Close would then shut a window the
+  // launcher never opened.
+  var before = app.windows.id();
+  app.Document({ url: request.url }).make();
+  var fresh = waitUntil(function () {
+    var ids = app.windows.id().filter(function (w) { return before.indexOf(w) === -1; });
+    return ids.length === 1 ? ids : null;
+  }, 6);
   app.activate();
-  return opened(request, id, wasClosed);
+  if (!fresh) {
+    return { ok: true, unidentified: "The browser opened the page, but its new window couldn't be picked out." };
+  }
+  if (wasClosed) {
+    delay(0.8); // the browser's own window can turn up a little after ours
+    closeBlankStartWindows(request, app, fresh[0]);
+  }
+  return opened(request, fresh[0], wasClosed);
 }
 
 // Ids of the real browser windows, ignoring panels and tooltips. Each property
@@ -387,18 +415,55 @@ function windowFor(request, running, handle) {
   return win;
 }
 
+// How many windows the browser has open, of any kind, ours or not.
+function countOpenWindows(request, app) {
+  if (request.kind === "chromium") return app.windows.length;
+  if (request.kind === "firefox") return browserWindowIds(app).length;
+  // Safari goes on listing closed windows for a while, invisible.
+  return app.windows().filter(function (w) {
+    try { return w.visible() || isMinimized(w); } catch (e) { return false; }
+  }).length;
+}
+
+// request.quitRuns: runs of this browser that the launcher itself started.
+// If the browser is still on one of them and closing left it with no windows
+// at all, it is quit as well, so nothing of the user's can be open in it.
+//
+// This happens here, in the same breath as the closing, on purpose: Safari
+// answers the first question from a new script by opening a Start Page
+// window if it has none, which would undo the very emptiness being checked.
 function closeWindows(request) {
   var running = runningApp(request.appPath);
+  var touched = false;
   // One of "closed", "gone" or "stuck" per handle, in the order they came.
   var outcomes = request.handles.map(function (handle) {
     var win = windowFor(request, running, handle);
     if (!win) return "gone";
+    touched = true;
     win.close();
     // A page can ask "leave this site?" and keep its window open.
     var went = waitUntil(function () { return !win.exists() || !win.visible(); }, 3);
     return went ? "closed" : "stuck";
   });
-  return { ok: true, outcomes: outcomes };
+
+  var quit = false;
+  var ours = (request.quitRuns || []).some(function (run) {
+    return running.pid !== 0 && run.pid === running.pid && run.startedAt === running.startedAt;
+  });
+  // Only when a window was actually found: otherwise this script hasn't
+  // spoken to the browser yet, and speaking to it now could open a window.
+  if (ours && touched) {
+    var app = Application(request.appPath);
+    // Its own start window may have turned up only after ours was opened.
+    closeBlankStartWindows(request, app, null);
+    // Windows that were just closed can take a moment to go.
+    var empty = waitUntil(function () { return countOpenWindows(request, app) === 0; }, 2.5);
+    if (empty) {
+      app.quit();
+      quit = true;
+    }
+  }
+  return { ok: true, outcomes: outcomes, quit: quit };
 }
 
 // What each window is showing right now, in the order the handles came in.
@@ -558,30 +623,6 @@ function arrangeWindows(request) {
   return { ok: true, outcomes: outcomes };
 }
 
-// Quits the browser if this is still the run the launcher started and it has
-// no windows left, so nothing of the user's can be open in it.
-function quitIfEmpty(request) {
-  var running = runningApp(request.appPath);
-  var sameRun = running.pid !== 0 && running.pid === request.run.pid &&
-    running.startedAt === request.run.startedAt;
-  if (!sameRun) return { ok: true, quit: false, stillThatRun: false };
-
-  var app = Application(request.appPath);
-  var countOpen = function () {
-    if (request.kind === "chromium") return app.windows.length;
-    if (request.kind === "firefox") return browserWindowIds(app).length;
-    // Safari goes on listing closed windows for a while, invisible.
-    return app.windows().filter(function (w) {
-      try { return w.visible() || isMinimized(w); } catch (e) { return false; }
-    }).length;
-  };
-  // Windows that were just closed can take a moment to go.
-  var empty = waitUntil(function () { return countOpen() === 0; }, 2.5);
-  if (!empty) return { ok: true, quit: false, stillThatRun: true };
-  app.quit();
-  return { ok: true, quit: true, stillThatRun: false };
-}
-
 // The two permissions that can be looked up without asking for them.
 function checkPermissions() {
   var accessibility = null;
@@ -595,7 +636,11 @@ function checkPermissions() {
 // Whether the launcher may control one browser. There is no way to look this
 // up quietly: the first time, macOS answers by asking the person.
 function checkControl(request) {
-  if (pidOf(request.appPath) === 0) return { ok: true, running: false };
+  var pid = pidOf(request.appPath);
+  if (pid === 0) return { ok: true, running: false };
+  // Safari opens a window when a script speaks to it while it has none.
+  // Not worth it just to look something up.
+  if (onScreenWindows(pid).length === 0) return { ok: true, running: true, noWindows: true };
   Application(request.appPath).windows.length;
   return { ok: true, running: true };
 }
@@ -606,7 +651,6 @@ var ACTIONS = {
   "window-bounds": boundsOfWindows,
   "screen-area": screenArea,
   "arrange-windows": arrangeWindows,
-  "quit-if-empty": quitIfEmpty,
   "check-permissions": checkPermissions,
   "check-control": checkControl,
   "open-chromium": openChromium,
@@ -787,6 +831,25 @@ export async function openTrackedWindow(options: {
     return openByWatchingWindows(appPath, options.commandLine);
   }
 
+  // A browser that isn't running is started here, before the script talks to
+  // it. A script that starts the browser itself can be left holding a dead
+  // connection (Orion does this), and only from here can a Chrome-family
+  // browser be given switches.
+  let justStarted = false;
+  if (!(await isRunning(appPath))) {
+    justStarted = true;
+    const switches = kind === "chromium" ? ["--args", ...QUIET_START] : [];
+    // -g: don't bring it forward yet; the script does that with our window.
+    await run("/usr/bin/open", ["-g", "-a", appPath, ...switches], {
+      timeout: 15_000,
+    }).catch(() => undefined); // The script starts it plainly if this didn't.
+    for (let tries = 0; tries < 50 && !(await isRunning(appPath)); tries++) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    // Up, but give it a moment before the first question.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+
   const reply = await script<
     | (WindowHandle & { startedBrowser?: boolean })
     | { windowId?: undefined; unidentified: string }
@@ -796,6 +859,7 @@ export async function openTrackedWindow(options: {
     appPath,
     url,
     private: options.private,
+    justStarted,
   });
   if (!reply.ok) return refused(reply);
   if (reply.windowId === undefined) {
@@ -818,21 +882,31 @@ export async function openTrackedWindow(options: {
 export type ClosedHow = "closed" | "gone" | "stuck";
 
 export type CloseOutcome =
-  /** One entry per handle, in the order they were given. */
-  | { ok: true; outcomes: ClosedHow[] }
+  /**
+   * `outcomes`: one entry per handle, in the order they were given.
+   * `quit`: the browser was left empty and was quit as well.
+   */
+  | { ok: true; outcomes: ClosedHow[]; quit: boolean }
   | { ok: false; notAllowed: boolean; detail: string };
 
-/** Closes the windows behind `handles`, skipping any that no longer exist. */
+/**
+ * Closes the windows behind `handles`, skipping any that no longer exist.
+ * `quitRuns` are runs of the browser that the launcher itself started: if
+ * the browser is still on one of them and ends up with no windows at all,
+ * it is quit too.
+ */
 export async function closeTrackedWindows(
   kind: ScriptingKind,
   appPath: string,
   handles: readonly WindowHandle[],
+  quitRuns: readonly { pid: number; startedAt: number }[] = [],
 ): Promise<CloseOutcome> {
-  const reply = await script<{ outcomes: ClosedHow[] }>({
+  const reply = await script<{ outcomes: ClosedHow[]; quit?: boolean }>({
     action: "close-windows",
     kind,
     appPath,
     handles,
+    quitRuns,
   });
   if (!reply.ok) {
     return {
@@ -841,7 +915,7 @@ export async function closeTrackedWindows(
       detail: reply.message,
     };
   }
-  return { ok: true, outcomes: reply.outcomes };
+  return { ok: true, outcomes: reply.outcomes, quit: reply.quit === true };
 }
 
 /** What one tracked window is showing; `open: false` once it is gone. */
@@ -969,24 +1043,6 @@ export async function arrangeTrackedWindows(
   return acted(await script({ action: "arrange-windows", kind, appPath, items }));
 }
 
-/**
- * Quits a browser if it is still the run described by `run` and has no
- * windows left. Resolves to whether it was quit.
- */
-export async function quitBrowserIfEmpty(
-  kind: ScriptingKind,
-  appPath: string,
-  run: { pid: number; startedAt: number },
-): Promise<boolean> {
-  const reply = await script<{ quit: boolean }>({
-    action: "quit-if-empty",
-    kind,
-    appPath,
-    run,
-  });
-  return reply.ok && reply.quit;
-}
-
 /** The permissions that can be looked up without asking for them. */
 export async function checkPermissions(): Promise<{
   screenRecording: boolean | null;
@@ -1009,12 +1065,15 @@ export async function checkPermissions(): Promise<{
  */
 export async function checkControl(
   appPath: string,
-): Promise<"allowed" | "refused" | "not-running" | "unknown"> {
-  const reply = await script<{ running: boolean }>({
+): Promise<"allowed" | "refused" | "not-running" | "no-windows" | "unknown"> {
+  const reply = await script<{ running: boolean; noWindows?: boolean }>({
     action: "check-control",
     appPath,
   });
-  if (reply.ok) return reply.running ? "allowed" : "not-running";
+  if (reply.ok) {
+    if (!reply.running) return "not-running";
+    return reply.noWindows ? "no-windows" : "allowed";
+  }
   return reply.code === NOT_ALLOWED ? "refused" : "unknown";
 }
 
