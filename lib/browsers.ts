@@ -245,6 +245,15 @@ type InstalledBrowser = DetectedBrowser & { appPath: string };
 /** Detection and launching are macOS-only for now. */
 export const isSupportedPlatform = process.platform === "darwin";
 
+/**
+ * Whether the launcher has the Accessibility permission. Looking this up
+ * never makes macOS ask the person anything.
+ */
+export async function hasAccessibility(): Promise<boolean | null> {
+  if (!isSupportedPlatform) return null;
+  return (await checkPermissions()).accessibility;
+}
+
 async function exists(target: string): Promise<boolean> {
   try {
     await access(target);

@@ -261,9 +261,13 @@ export function Launcher() {
     .map((browser) => browser.id);
   const tickedCount = ticked.reduce((sum, id) => sum + openIn(id), 0);
 
-  const needSetup = chosen
-    .filter((browser) => browser.needsAccessibility)
-    .map((browser) => browser.name);
+  // Only worth a note while the permission is actually missing (or unknown).
+  const needSetup =
+    data?.accessibility === true
+      ? []
+      : chosen
+          .filter((browser) => browser.needsAccessibility)
+          .map((browser) => browser.name);
   const lostBrowsers: LostBrowser[] = installed.flatMap((browser) => {
     const note = lost[browser.id];
     return note

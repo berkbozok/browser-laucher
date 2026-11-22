@@ -64,7 +64,9 @@ the page shows which ones you have.
 | Accessibility | System Settings → Privacy & Security → Accessibility | Incognito windows in Safari and Orion |
 
 Without a permission the launcher still does what it can and tells you what
-is missing.
+is missing. The note about Safari and Orion under the browser list goes away
+once Accessibility is on (press Rescan if you switched it on with the page
+open).
 
 ## Start it without a terminal
 

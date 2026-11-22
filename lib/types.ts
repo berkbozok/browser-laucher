@@ -19,6 +19,12 @@ export type BrowsersResponse = {
   /** False when the server runs on an OS we can't detect browsers on yet. */
   supported: boolean;
   browsers: BrowserInfo[];
+  /**
+   * Whether the launcher has the macOS Accessibility permission, which some
+   * browsers need for their incognito window. Null when it couldn't be
+   * found out.
+   */
+  accessibility: boolean | null;
 };
 
 export type OpenRequest = {
